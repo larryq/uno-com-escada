@@ -57,7 +57,7 @@ const AI = (() => {
   A.inp = inp;
   const tmp = new Float64Array(6);
   A.drive = (car, speedScale) => {
-    const s = car.s, v = car.u;
+    const s = car.trackDistance, v = car.forwardVelocity;
     const i = Math.floor(s / T.ds) % N;
     // alvo de velocidade (olhando um pouco à frente)
     let vt = 1e9;
@@ -67,19 +67,19 @@ const AI = (() => {
     const Ld = 5 + Math.abs(v) * 0.42;
     const j = (i + Math.round(Ld / T.ds)) % N;
     const dx = px[j] - car.x, dz = pz[j] - car.z;
-    const c = Math.cos(car.psi), sn = Math.sin(car.psi);
+    const c = Math.cos(car.headingRadians), sn = Math.sin(car.headingRadians);
     const la = dx * c + dz * sn, lb = -dx * sn + dz * c;
     const alpha = Math.atan2(lb, la);
     let delta = Math.atan(2 * 2.36 * Math.sin(alpha) / Math.hypot(dx, dz));
     // amortecimento da guinada
-    delta -= car.r * 0.03;
+    delta -= car.yawRate * 0.03;
     const lock = PHYS.maxSteer / (1 + Math.abs(v) * 0.045);
     const want = clamp(delta / lock, -1, 1);
     const db = 0.03;
     inp.left = false; inp.right = false;
-    if (car.steerIn < want - db) inp.right = true;
-    else if (car.steerIn > want + db) inp.left = true;
-    else if (Math.abs(want) > 0.06) { if (want > 0) inp.right = car.steerIn < want; else inp.left = car.steerIn > want; }
+    if (car.steeringInput < want - db) inp.right = true;
+    else if (car.steeringInput > want + db) inp.left = true;
+    else if (Math.abs(want) > 0.06) { if (want > 0) inp.right = car.steeringInput < want; else inp.left = car.steeringInput > want; }
     // acelerador/freio
     inp.up = false; inp.down = false; inp.hand = false;
     if (v < vt - 0.3) inp.up = true;

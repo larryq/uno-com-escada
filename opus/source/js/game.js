@@ -19,7 +19,8 @@ const GAME = (() => {
   G.frameState = fs;
 
   // ------------------------------------------------ estado do jogo
-  const car = new Car();
+  // The vehicle owns physics state; graphics, sound, HUD and AI only consume it.
+  const car = new VehiclePhysics();
   G.car = car;
   const input = { up: false, down: false, left: false, right: false, hand: false, analog: false, stick: false, a: new Float64Array(3) };
   const keysDown = { up: false, down: false, left: false, right: false, hand: false };
@@ -152,15 +153,15 @@ const GAME = (() => {
   G.pose = pose;
   const prevSt = { x: 0, y: 0, z: 0, psi: 0, roll: 0, pitch: 0, pg: 0, rg: 0, spin: new Float64Array(4) };
   function copyPrev() {
-    prevSt.x = car.x; prevSt.y = car.y; prevSt.z = car.z; prevSt.psi = car.psi; prevSt.roll = car.roll; prevSt.pitch = car.pitch;
-    prevSt.pg = car.pitchG; prevSt.rg = car.rollG; for (let k = 0; k < 4; k++) prevSt.spin[k] = car.spin[k];
+    prevSt.x = car.x; prevSt.y = car.y; prevSt.z = car.z; prevSt.psi = car.headingRadians; prevSt.roll = car.roll; prevSt.pitch = car.pitch;
+    prevSt.pg = car.roadPitch; prevSt.rg = car.roadRoll; for (let k = 0; k < 4; k++) prevSt.spin[k] = car.wheelSpinAngles[k];
   }
   function angLerp(a, b, t) { let d = b - a; while (d > PI) d -= TAU; while (d < -PI) d += TAU; return a + d * t; }
   function updatePose() {
     const alpha = clamp(F[1] / PHYS.DT, 0, 1);
     const x = lerp(prevSt.x, car.x, alpha), y = lerp(prevSt.y, car.y, alpha), z = lerp(prevSt.z, car.z, alpha);
-    const psi = angLerp(prevSt.psi, car.psi, alpha);
-    const pg = lerp(prevSt.pg, car.pitchG, alpha), rg = lerp(prevSt.rg, car.rollG, alpha);
+    const psi = angLerp(prevSt.psi, car.headingRadians, alpha);
+    const pg = lerp(prevSt.pg, car.roadPitch, alpha), rg = lerp(prevSt.rg, car.roadRoll, alpha);
     const c = Math.cos(psi), s = Math.sin(psi);
     const cp = Math.cos(pg), sp = Math.sin(pg);
     pose.fx = c * cp; pose.fy = sp; pose.fz = s * cp;
@@ -172,10 +173,10 @@ const GAME = (() => {
     const ul = Math.hypot(pose.ux, pose.uy, pose.uz); pose.ux /= ul; pose.uy /= ul; pose.uz /= ul;
     pose.x = x; pose.y = y; pose.z = z;
     pose.roll = lerp(prevSt.roll, car.roll, alpha); pose.pitch = lerp(prevSt.pitch, car.pitch, alpha); pose.heave = car.heave;
-    pose.steer = car.steer;
-    for (let k = 0; k < 4; k++) { pose.spin[k] = angLerp(prevSt.spin[k], car.spin[k], alpha); pose.drop[k] = 0; }
-    pose.brake = car.brk > 0.05 ? 1 : 0;
-    pose.reverse = car.reverse && car.thr > 0.05 ? 1 : 0;
+    pose.steer = car.steeringAngle;
+    for (let k = 0; k < 4; k++) { pose.spin[k] = angLerp(prevSt.spin[k], car.wheelSpinAngles[k], alpha); pose.drop[k] = 0; }
+    pose.brake = car.brake > 0.05 ? 1 : 0;
+    pose.reverse = car.reverse && car.throttle > 0.05 ? 1 : 0;
   }
 
   // ------------------------------------------------ câmeras
@@ -209,7 +210,7 @@ const GAME = (() => {
       if (!camInit) { ch.yaw = yawT; ch.y = pose.y; camInit = true; }
       ch.yaw = angLerp(ch.yaw, yawT, 1 - Math.exp(-dt * 3.6));
       ch.y += (pose.y - ch.y) * (1 - Math.exp(-dt * 8));
-      const spd = Math.abs(car.u);
+      const spd = Math.abs(car.forwardVelocity);
       const dist = 6.2 + spd * 0.035, h = 1.95;
       const cx = Math.cos(ch.yaw), cz = Math.sin(ch.yaw);
       c.x = pose.x - cx * dist * lb; c.z = pose.z - cz * dist * lb;
@@ -231,7 +232,7 @@ const GAME = (() => {
     } else {
       let best = 0, bd = 1e9;
       for (let i = 0; i < tvCams.length; i++) {
-        let d = car.s - tvCams[i].s; if (d < -TRACK.L / 2) d += TRACK.L; if (d > TRACK.L / 2) d -= TRACK.L;
+        let d = car.trackDistance - tvCams[i].s; if (d < -TRACK.L / 2) d += TRACK.L; if (d > TRACK.L / 2) d -= TRACK.L;
         const ad = Math.abs(d - 15);
         if (ad < bd) { bd = ad; best = i; }
       }
@@ -262,7 +263,7 @@ const GAME = (() => {
       const f = Math.floor(simFrame / 2);
       const k = f < LAP.keys.length ? LAP.keys[f] : 0;
       input.up = !!(k & 1); input.down = !!(k & 2); input.left = !!(k & 4); input.right = !!(k & 8); input.hand = !!(k & 16);
-      if (f >= LAP.keys.length) { input.down = car.u > 0.5; }
+      if (f >= LAP.keys.length) { input.down = car.forwardVelocity > 0.5; }
       input.analog = false;
     } else if (G.mode === 'ai') {
       const a = AI.drive(car, 1.0);
@@ -280,7 +281,7 @@ const GAME = (() => {
     car.step(input, PHYS.DT);
     simFrame++;
     F[0] += PHYS.DT;
-    let ds = car.s - F[3]; if (ds < -TRACK.L / 2) ds += TRACK.L; if (ds > TRACK.L / 2) ds -= TRACK.L;
+    let ds = car.trackDistance - F[3]; if (ds < -TRACK.L / 2) ds += TRACK.L; if (ds > TRACK.L / 2) ds -= TRACK.L;
     // cronômetro do painel: a volta conta ao cruzar a linha de largada, para a frente, depois de dar a volta inteira
     {
       let r0 = F[3] - TRACK.sStart; if (r0 > TRACK.L / 2) r0 -= TRACK.L; else if (r0 < -TRACK.L / 2) r0 += TRACK.L;
@@ -292,7 +293,7 @@ const GAME = (() => {
         LT[3] = tc; LT[4] = r0 + ds; LT[5] = 1; LT[6] = G.mode === 'play' ? 1 : 0;
       }
     }
-    F[3] = car.s; F[4] += ds;
+    F[3] = car.trackDistance; F[4] += ds;
     if (F[4] >= TRACK.L - 8) { if (lapRunning) G.lastLap = F[0] - F[2]; else if (!G.lapCount) G.lapCount = 0; G.lapCount = (G.lapCount || 0) + 1; lapRunning = true; F[2] = F[0]; F[4] -= TRACK.L; if (G.lapCount > 1) G.lastLap2 = G.lastLap; }
     if (typeof FX !== 'undefined') FX.simStep(car, PHYS.DT);
     SND.simStep(car, PHYS.DT);
@@ -300,7 +301,7 @@ const GAME = (() => {
   G.startScripted = () => {
     G.mode = 'replay';
     car.placeOnTrack(LAP.meta.startS, LAP.meta.startU);
-    F[0] = 0; simFrame = 0; F[1] = 0; F[2] = 0; lapRunning = true; F[4] = 0; F[3] = car.s; G.lastLap = 0;
+    F[0] = 0; simFrame = 0; F[1] = 0; F[2] = 0; lapRunning = true; F[4] = 0; F[3] = car.trackDistance; G.lastLap = 0;
     copyPrev(); camInit = false; fs.cut = true;
     if (typeof FX !== 'undefined') FX.reset();
     lapReset(); SND.reset();
@@ -325,7 +326,7 @@ const GAME = (() => {
     cubeC[0] = pose.x; cubeC[1] = pose.y + 0.75; cubeC[2] = pose.z; fs.cubeCenter = cubeC;
     { const hl = Math.hypot(pose.fx, pose.fz) || 1; fs.carFx = pose.fx / hl; fs.carFz = pose.fz / hl; }
     fs.dt = dt; fs.time += dt;
-    fs.speedKmh = Math.abs(car.u) * 3.6;
+    fs.speedKmh = Math.abs(car.forwardVelocity) * 3.6;
     fs.lapTime = F[0] - F[2];
     if (typeof FX !== 'undefined') FX.frame(fs);
     RENDER.renderFrame(fs);
@@ -337,7 +338,7 @@ const GAME = (() => {
     const lb = lookKey || padLook;
     if (lb !== !!G.lookBack) { G.lookBack = lb; camInit = false; fs.cut = true; }
     if (!UI.on) { frame(); return; }
-    if (UI.watch && G.mode === 'replay' && simFrame >= LAP.keys.length * 2 && Math.abs(car.u) < 0.5) takeOver();
+    if (UI.watch && G.mode === 'replay' && simFrame >= LAP.keys.length * 2 && Math.abs(car.forwardVelocity) < 0.5) takeOver();
     frame();
     LT[0] = LT[5] === 1 ? F[0] - LT[3] : 0;
     if (hudOn) HUD.draw(car, LT);
@@ -394,7 +395,7 @@ const GAME = (() => {
       G.mode = 'play'; G.camMode = 0; frozen = false; fs.hud = false;
       let best = 380, bd = -9; const sd = RENDER.sun.dir;      // trecho aberto, de frente para o sol
       for (let s = 360; s < 430; s += 1) { TRACK.sampleS(s, ts6); const d = ts6[3] * sd[0] + ts6[4] * sd[2]; if (d > bd) { bd = d; best = s; } }
-      car.placeOnTrack(best, 1.5); F[3] = car.s; F[1] = 0; copyPrev(); updatePose();
+      car.placeOnTrack(best, 1.5); F[3] = car.trackDistance; F[1] = 0; copyPrev(); updatePose();
       const q = POSES[n - 1], p = pose;
       if (n <= 3) G.setPose(p.x + p.fx * q[0] - p.fz * q[1], p.y + q[2], p.z + p.fz * q[0] + p.fx * q[1], p.x + p.fx * q[3] - p.fz * q[4], p.y + q[5], p.z + p.fz * q[3] + p.fx * q[4], q[6]);
       else G.setPose(q[0], q[1], q[2], q[3], q[4], q[5], q[6]);
@@ -473,7 +474,7 @@ const GAME = (() => {
       const H = +(params.get('h') || Math.round(canvas.clientHeight * devicePixelRatio));
       RENDER.resize(W, H);
       if (LAP.meta) car.placeOnTrack(LAP.meta.startS, LAP.meta.startU); else car.placeOnTrack(TRACK.sStart - 8, 2);
-      F[3] = car.s; copyPrev();
+      F[3] = car.trackDistance; copyPrev();
       if (G.mode === 'replay') G.startScripted();
       if (params.has('cam')) G.camMode = +params.get('cam');
       if (params.has('debug')) RENDER.debug = +params.get('debug');
@@ -503,9 +504,9 @@ const GAME = (() => {
     if (c !== G.camMode) { G.camMode = c; camInit = false; fs.cut = true; }
   };
   G.renderN = async (n, dt) => { for (let i = 0; i < n; i++) { F[7] = dt; tick(); } await RENDER.device.queue.onSubmittedWorkDone(); };
-  G.state = () => ({ speed: car.u, kmh: Math.abs(car.u) * 3.6, steer: car.steer, steerIn: car.steerIn, brake: car.brk, hb: car.hb, x: car.x, z: car.z, psi: car.psi, s: car.s, u: car.u_lat,
-    cam: G.camMode, camName: CAM_NAMES[G.camMode], camPos: [fs.cam.x, fs.cam.y, fs.cam.z], offWheels: car.offTrackWheels, gear: car.gear, reverse: car.reverse, simTime: F[0], lap: G.lastLap, yawRate: car.r, roll: car.roll, pitch: car.pitch, mode: G.mode,
-    thr: car.thr, rpm: car.rpm, rpmSom: SND.M[0], steerRate: input.stick ? 'analógico' : 'teclas', pad: padN, lookBack: !!G.lookBack, camTarget: [fs.cam.tx, fs.cam.ty, fs.cam.tz],
+  G.state = () => ({ speed: car.forwardVelocity, kmh: Math.abs(car.forwardVelocity) * 3.6, steer: car.steeringAngle, steerIn: car.steeringInput, brake: car.brake, hb: car.handbrake, x: car.x, z: car.z, psi: car.headingRadians, s: car.trackDistance, u: car.trackLateralOffset,
+    cam: G.camMode, camName: CAM_NAMES[G.camMode], camPos: [fs.cam.x, fs.cam.y, fs.cam.z], offWheels: car.offTrackWheelCount, gear: car.gear, reverse: car.reverse, simTime: F[0], lap: G.lastLap, yawRate: car.yawRate, roll: car.roll, pitch: car.pitch, mode: G.mode,
+    thr: car.throttle, rpm: car.rpm, rpmSom: SND.M[0], steerRate: input.stick ? 'analógico' : 'teclas', pad: padN, lookBack: !!G.lookBack, camTarget: [fs.cam.tx, fs.cam.ty, fs.cam.tz],
     screen: UI.screen, paused, frozen, pose: UI.pose, bench: UI.bench, watch: UI.watch, stats: UI.stats, muted: SND.muted, audio: SND.ctx ? SND.ctx.state : 'nenhum', hud: hudOn, shaderHud: fs.hud,
     lapNow: LT[0], lapLast: LT[1], lapBest: LT[2], laps: LT[7], frame: simFrame });
 
