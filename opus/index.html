@@ -1988,17 +1988,24 @@ p.end();
 return V;
 })();
 
+/**
+* Calibrated constants. SI units unless explicitly noted.
+* DT: seconds per simulation step; SUB: wheel-integration substeps.
+* Iz: yaw inertia (kg*m²); cgA/cgB: distance from center of mass to axles.
+* cgH: center-of-mass height (m); R: wheel radius (m); Iw: wheel inertia.
+* Numerical values are deliberately unchanged by this readability pass.
+*/
 const PHYS = {
 DT: 1 / 120, SUB: 4,
 mass: 845, Iz: 1150, g: 9.81,
-cgA: 0.944,                 // CG -> eixo dianteiro
-cgB: 1.416,                 // CG -> eixo traseiro
+cgA: 0.944,                 // center of mass to front axle
+cgB: 1.416,                 // center of mass to rear axle
 cgH: 0.50,
 R: 0.292, Iw: 0.9,
 gears: [3.909, 2.157, 1.480, 1.121, 0.902], final: 4.071, revGear: 3.818,
 idle: 900, redline: 6300,
 brakeF: 1000, brakeR: 360, handbrake: 1700,
-maxSteer: 0.62,             // rad nas rodas (batente)
+maxSteer: 0.62,             // maximum wheel steering angle (radians)
 dragK: 0.40, roll: 0.013,
 };
 function engineTorque(rpm) {
@@ -2009,48 +2016,97 @@ if (r < 5.0) return 122;
 if (r < 6.3) return 122 - (r - 5) * 20;
 return 45;
 }
-class Car {
+/**
+* One vehicle's authoritative CPU-side state. The rest of the game reads it.
+* forwardVelocity, lateralVelocity: speeds in the car's own frame (m/s).
+* headingRadians, yawRate: orientation (rad) and rotation speed (rad/s).
+* trackDistance, trackLateralOffset: position relative to course centerline (m).
+*/
+class VehiclePhysics {
 constructor() {
-this.x = 0; this.z = 0; this.y = 0; this.psi = 0;
-this.u = 0; this.v = 0; this.r = 0;       // velocidades locais e guinada
-this.w = new Float64Array(4);             // vel. angular das rodas (DE, DD, TE, TD)
-this.spin = new Float64Array(4);
-this.steer = 0; this.thr = 0; this.brk = 0; this.hb = 0; this.steerIn = 0;
-this.gear = 1; this.rpm = 900; this.reverse = false; this.shiftT = 0;
-this.ax = 0; this.ay = 0;
-this.roll = 0; this.rollV = 0; this.pitch = 0; this.pitchV = 0; this.heave = 0; this.heaveV = 0;
-this.pitchG = 0; this.rollG = 0;
-this.hint = -1; this.s = 0; this.u_lat = 0;
-this.slip = new Float64Array(4);          // velocidade de escorregamento (m/s)
-this.sn = new Float64Array(4);            // escorregamento normalizado (1 = pico de aderência) — só leitura (som)
-this.load = new Float64Array(4);
-this.surf = new Uint8Array(4);            // 0 asfalto, 1 zebra, 2 grama, 3 brita
-this.wetW = new Float64Array(4);
-this.wx = new Float64Array(4); this.wz = new Float64Array(4); this.wy = new Float64Array(4);
-this.onAsphalt = true; this.offTrackWheels = 0;
-this.wallHit = 0; this.time = 0;
-this._p = new Float64Array(3); this._ts = new Float64Array(6);
-this.fx = new Float64Array(4); this.fy = new Float64Array(4);
+this.x = 0;
+this.z = 0;
+this.y = 0;
+this.headingRadians = 0;
+this.forwardVelocity = 0;
+this.lateralVelocity = 0;
+this.yawRate = 0;       // car-local forward/right speed and yaw rate
+this.wheelAngularVelocities = new Float64Array(4);             // wheel angular speed (front-left, front-right, rear-left, rear-right)
+this.wheelSpinAngles = new Float64Array(4);
+this.steeringAngle = 0;
+this.throttle = 0;
+this.brake = 0;
+this.handbrake = 0;
+this.steeringInput = 0;
+this.gear = 1;
+this.rpm = 900;
+this.reverse = false;
+this.gearShiftCooldown = 0;
+this.forwardAcceleration = 0;
+this.lateralAcceleration = 0;
+this.roll = 0;
+this.rollVelocity = 0;
+this.pitch = 0;
+this.pitchVelocity = 0;
+this.heave = 0;
+this.heaveVelocity = 0;
+this.roadPitch = 0;
+this.roadRoll = 0;
+this.trackSegmentHint = -1;
+this.trackDistance = 0;
+this.trackLateralOffset = 0;
+this.slip = new Float64Array(4);          // slip speed (m/s)
+this.normalizedTireSlip = new Float64Array(4);            // dimensionless tire slip (1 ≈ peak grip); audio reads this
+this.wheelNormalLoads = new Float64Array(4);
+this.wheelSurfaceTypes = new Uint8Array(4);            // 0 asphalt, 1 curb, 2 grass, 3 gravel
+this.wheelWetness = new Float64Array(4);
+this.wheelWorldX = new Float64Array(4);
+this.wheelWorldZ = new Float64Array(4);
+this.wheelWorldY = new Float64Array(4);
+this.onAsphalt = true;
+this.offTrackWheelCount = 0;
+this.wallImpactSpeed = 0;
+this.elapsedSeconds = 0;
+this._trackProjection = new Float64Array(3);
+this._trackSample = new Float64Array(6);
+this.wheelForwardForces = new Float64Array(4);
+this.wheelLateralForces = new Float64Array(4);
 }
-speed() { return Math.hypot(this.u, this.v); }
+speed() { return Math.hypot(this.forwardVelocity, this.lateralVelocity); }
+/** Reset the car at longitudinal track distance s and signed lateral offset uOff (meters). */
 placeOnTrack(s, uOff) {
-const T = TRACK, o = this._p;
-const ts = this._ts;
+const T = TRACK, o = this._trackProjection;
+const ts = this._trackSample;
 T.sampleS(s, ts);
-this.psi = Math.atan2(ts[4], ts[3]);
+this.headingRadians = Math.atan2(ts[4], ts[3]);
 const rx = -ts[4], rz = ts[3];
-this.x = ts[0] + rx * uOff; this.z = ts[2] + rz * uOff;
-this.u = this.v = this.r = 0; this.w.fill(0); this.spin.fill(0); this.slip.fill(0); this.sn.fill(0);
-this.steer = 0; this.steerIn = 0; this.thr = this.brk = this.hb = 0; this.gear = 1; this.reverse = false;
-this.rpm = PHYS.idle; this.shiftT = 0; this.ax = 0; this.ay = 0;
-this.roll = this.rollV = this.pitch = this.pitchV = this.heave = this.heaveV = 0;
-this.fx.fill(0); this.fy.fill(0); this.wallHit = 0; this.time = 0;
-this.hint = -1;
+this.x = ts[0] + rx * uOff;
+this.z = ts[2] + rz * uOff;
+this.forwardVelocity = this.lateralVelocity = this.yawRate = 0;
+this.wheelAngularVelocities.fill(0);
+this.wheelSpinAngles.fill(0);
+this.slip.fill(0);
+this.normalizedTireSlip.fill(0);
+this.steeringAngle = 0;
+this.steeringInput = 0;
+this.throttle = this.brake = this.handbrake = 0;
+this.gear = 1;
+this.reverse = false;
+this.rpm = PHYS.idle;
+this.gearShiftCooldown = 0;
+this.forwardAcceleration = 0;
+this.lateralAcceleration = 0;
+this.roll = this.rollVelocity = this.pitch = this.pitchVelocity = this.heave = this.heaveVelocity = 0;
+this.wheelForwardForces.fill(0);
+this.wheelLateralForces.fill(0);
+this.wallImpactSpeed = 0;
+this.elapsedSeconds = 0;
+this.trackSegmentHint = -1;
 this.updateGround();
 }
 groundAt(x, z, k) {
-const T = TRACK, o = this._p;
-T.project(x, z, this.hint, o);
+const T = TRACK, o = this._trackProjection;
+T.project(x, z, this.trackSegmentHint, o);
 const s = o[0], u = o[1];
 const hw = T.lerpArr(T.hw, s);
 const au = Math.abs(u);
@@ -2064,155 +2120,204 @@ const gw = u > 0 ? T.lerpArr(T.gravR, s) : T.lerpArr(T.gravL, s);
 const g0 = hw + kw + 1.6;
 surf = (gw > 1.5 && au > g0 && au < g0 + gw) ? 3 : 2;
 }
-if (k >= 0) { this.surf[k] = surf; this.wetW[k] = surf === 0 ? T.lerpArr(T.wet, s) : 0; }
+if (k >= 0) { this.wheelSurfaceTypes[k] = surf;
+this.wheelWetness[k] = surf === 0 ? T.lerpArr(T.wet, s) : 0; }
 return y;
 }
+/** Locate the car and all wheels on the track/terrain; update ground alignment. */
 updateGround() {
-const c = Math.cos(this.psi), sn = Math.sin(this.psi);
-const T = TRACK, o = this._p;
-T.project(this.x, this.z, this.hint, o);
-this.hint = o[2]; this.s = o[0]; this.u_lat = o[1];
+const c = Math.cos(this.headingRadians), sn = Math.sin(this.headingRadians);
+const T = TRACK, o = this._trackProjection;
+T.project(this.x, this.z, this.trackSegmentHint, o);
+this.trackSegmentHint = o[2];
+this.trackDistance = o[0];
+this.trackLateralOffset = o[1];
 let off = 0;
 for (let k = 0; k < 4; k++) {
 const a = k < 2 ? 1.18 : -1.18, b = (k & 1 ? 1 : -1) * (k < 2 ? 0.67 : 0.655);
 const x = this.x + c * a - sn * b, z = this.z + sn * a + c * b;
-this.wx[k] = x; this.wz[k] = z;
-this.wy[k] = this.groundAt(x, z, k);
-T.project(x, z, this.hint, o);
+this.wheelWorldX[k] = x;
+this.wheelWorldZ[k] = z;
+this.wheelWorldY[k] = this.groundAt(x, z, k);
+T.project(x, z, this.trackSegmentHint, o);
 if (Math.abs(o[1]) > T.lerpArr(T.hw, o[0]) + 0.3) off++;
 }
-this.offTrackWheels = off;
+this.offTrackWheelCount = off;
 this.onAsphalt = off === 0;
-const yf = (this.wy[0] + this.wy[1]) * 0.5, yr = (this.wy[2] + this.wy[3]) * 0.5;
-const yl = (this.wy[0] + this.wy[2]) * 0.5, yrr = (this.wy[1] + this.wy[3]) * 0.5;
-this.pitchG = Math.atan2(yf - yr, 2.36);
-this.rollG = Math.atan2(yl - yrr, 1.33);
+const yf = (this.wheelWorldY[0] + this.wheelWorldY[1]) * 0.5, yr = (this.wheelWorldY[2] + this.wheelWorldY[3]) * 0.5;
+const yl = (this.wheelWorldY[0] + this.wheelWorldY[2]) * 0.5, yrr = (this.wheelWorldY[1] + this.wheelWorldY[3]) * 0.5;
+this.roadPitch = Math.atan2(yf - yr, 2.36);
+this.roadRoll = Math.atan2(yl - yrr, 1.33);
 this.y = (yf + yr) * 0.5;
 }
-step(inp, dt) {
-const P = PHYS;
-const spd = this.u;
-const an = inp.analog === true, A = inp.a;
-const steerTarget = an ? A[0] : (inp.right ? 1 : 0) - (inp.left ? 1 : 0);
-const rate = an && inp.stick ? 9.0 : steerTarget === 0 ? 4.0 : (Math.sign(steerTarget) !== Math.sign(this.steerIn) && this.steerIn !== 0 ? 6.0 : 2.6);
-this.steerIn += clamp(steerTarget - this.steerIn, -rate * dt, rate * dt);
-const lock = P.maxSteer / (1 + Math.abs(spd) * 0.045);
-this.steer = this.steerIn * lock;
-let wantThr = 0, wantBrk = 0;
-const aU = an ? A[1] : (inp.up ? 1 : 0), aD = an ? A[2] : (inp.down ? 1 : 0);
-if (aU > 0) { if (this.reverse && spd < -0.5) wantBrk = aU; else { wantThr = aU; if (Math.abs(spd) < 0.6) this.reverse = false; } }
-if (aD > 0) {
-if (!this.reverse && spd > 0.6) wantBrk = aD;
-else { this.reverse = true; wantThr = aD; }
+/**
+* Advance one deterministic physics step:
+* user input -> drivetrain -> wheel loads -> tire forces -> body motion.
+* The renderer has no influence on these calculations.
+* @param {object} controls Current keyboard/gamepad command state.
+* @param {number} deltaTimeSeconds Usually PHYS.DT (1/120 s).
+*/
+step(controls, deltaTimeSeconds) {
+this.updateDriverControls(controls, deltaTimeSeconds);
+const driveTorqueNm = this.updatePowertrain(deltaTimeSeconds);
+this.updateWheelLoads();
+this.integrateVehicleDynamics(deltaTimeSeconds, driveTorqueNm);
 }
-if (!(aU > 0) && !(aD > 0) && this.reverse && spd > 0.2) this.reverse = false;
-this.thr += clamp(wantThr - this.thr, -8 * dt, 6 * dt);
-this.brk += clamp(wantBrk - this.brk, -10 * dt, 7 * dt);
-this.hb += clamp((inp.hand ? 1 : 0) - this.hb, -10 * dt, 12 * dt);
-const wheelRpmF = Math.abs((this.w[0] + this.w[1]) * 0.5) * 60 / TAU;
-const carRpmW = Math.abs(this.u) / P.R * 60 / TAU;
-this.shiftT = Math.max(0, this.shiftT - dt);
-if (!this.reverse && this.shiftT === 0) {
-const rUp = carRpmW * P.gears[this.gear - 1] * P.final;
-if (rUp > 6000 && this.gear < 5) { this.gear++; this.shiftT = 0.22; }
-else if (this.gear > 1 && carRpmW * P.gears[this.gear - 2] * P.final < 4300 && rUp < 2700) { this.gear--; this.shiftT = 0.18; }
+/** Smooth steering and pedals and determine forward/reverse selection. */
+updateDriverControls(controls, deltaTimeSeconds) {
+const parameters = PHYS;
+const forwardSpeed = this.forwardVelocity;
+const usesAnalogInput = controls.analog === true;
+const analogControls = controls.a;
+const steeringTarget = usesAnalogInput ? analogControls[0] : (controls.right ? 1 : 0) - (controls.left ? 1 : 0);
+const steeringResponseRate = usesAnalogInput && controls.stick ? 9.0 : steeringTarget === 0 ? 4.0 : (Math.sign(steeringTarget) !== Math.sign(this.steeringInput) && this.steeringInput !== 0 ? 6.0 : 2.6);
+this.steeringInput += clamp(steeringTarget - this.steeringInput, -steeringResponseRate * deltaTimeSeconds, steeringResponseRate * deltaTimeSeconds);
+const maxSteeringAtSpeed = parameters.maxSteer / (1 + Math.abs(forwardSpeed) * 0.045);
+this.steeringAngle = this.steeringInput * maxSteeringAtSpeed;
+let requestedThrottle = 0, requestedBrake = 0;
+const acceleratorControl = usesAnalogInput ? analogControls[1] : (controls.up ? 1 : 0), brakeControl = usesAnalogInput ? analogControls[2] : (controls.down ? 1 : 0);
+if (acceleratorControl > 0) { if (this.reverse && forwardSpeed < -0.5) requestedBrake = acceleratorControl; else { requestedThrottle = acceleratorControl; if (Math.abs(forwardSpeed) < 0.6) this.reverse = false; } }
+if (brakeControl > 0) {
+if (!this.reverse && forwardSpeed > 0.6) requestedBrake = brakeControl;
+else { this.reverse = true; requestedThrottle = brakeControl; }
 }
-const ratio = this.reverse ? P.revGear : P.gears[this.gear - 1];
-this.rpm = Math.max(P.idle, Math.max(wheelRpmF, carRpmW * 0.98) * ratio * P.final);
+if (!(acceleratorControl > 0) && !(brakeControl > 0) && this.reverse && forwardSpeed > 0.2) this.reverse = false;
+this.throttle += clamp(requestedThrottle - this.throttle, -8 * deltaTimeSeconds, 6 * deltaTimeSeconds);
+this.brake += clamp(requestedBrake - this.brake, -10 * deltaTimeSeconds, 7 * deltaTimeSeconds);
+this.handbrake += clamp((controls.hand ? 1 : 0) - this.handbrake, -10 * deltaTimeSeconds, 12 * deltaTimeSeconds);
+}
+/** Automatic shifting and engine power, returning drive-axle torque in N·m. */
+updatePowertrain(deltaTimeSeconds) {
+const parameters = PHYS;
+const drivenWheelRpm = Math.abs((this.wheelAngularVelocities[0] + this.wheelAngularVelocities[1]) * 0.5) * 60 / TAU;
+const vehicleWheelRpm = Math.abs(this.forwardVelocity) / parameters.R * 60 / TAU;
+this.gearShiftCooldown = Math.max(0, this.gearShiftCooldown - deltaTimeSeconds);
+if (!this.reverse && this.gearShiftCooldown === 0) {
+const predictedEngineRpm = vehicleWheelRpm * parameters.gears[this.gear - 1] * parameters.final;
+if (predictedEngineRpm > 6000 && this.gear < 5) { this.gear++;
+this.gearShiftCooldown = 0.22; }
+else if (this.gear > 1 && vehicleWheelRpm * parameters.gears[this.gear - 2] * parameters.final < 4300 && predictedEngineRpm < 2700) { this.gear--;
+this.gearShiftCooldown = 0.18; }
+}
+const transmissionRatio = this.reverse ? parameters.revGear : parameters.gears[this.gear - 1];
+this.rpm = Math.max(parameters.idle, Math.max(drivenWheelRpm, vehicleWheelRpm * 0.98) * transmissionRatio * parameters.final);
 if (this.reverse) this.gear = 1;
-const cutting = this.shiftT > 0.12;
-let engT = engineTorque(Math.min(this.rpm, P.redline)) * this.thr * (cutting ? 0.1 : 1);
-if (this.rpm >= P.redline) engT *= 0.2;
-const driveT = engT * ratio * P.final * 0.9 * (this.reverse ? -1 : 1);
-const L = P.cgA + P.cgB, m = P.mass, g = P.g;
-const fzF = m * g * P.cgB / L - m * this.ax * P.cgH / L;
-const fzR = m * g * P.cgA / L + m * this.ax * P.cgH / L;
-const latF = m * this.ay * P.cgH / 1.34 * 0.6, latR = m * this.ay * P.cgH / 1.31 * 0.4;
-this.load[0] = Math.max(50, fzF * 0.5 + latF); this.load[1] = Math.max(50, fzF * 0.5 - latF);
-this.load[2] = Math.max(50, fzR * 0.5 + latR); this.load[3] = Math.max(50, fzR * 0.5 - latR);
-const subDt = dt / P.SUB;
-let Fx = 0, Fy = 0, Mz = 0;
-for (let k = 0; k < 4; k++) { this.fx[k] = 0; this.fy[k] = 0; }
-for (let ss = 0; ss < P.SUB; ss++) {
-for (let k = 0; k < 4; k++) {
-const front = k < 2;
-const a = front ? P.cgA : -P.cgB;
-const b = (k & 1 ? 1 : -1) * (front ? 0.67 : 0.655);
-const vxl = this.u - this.r * b, vyl = this.v + this.r * a;
-const d = front ? this.steer * (1 + (k & 1 ? -1 : 1) * this.steer * 0.12) : 0;
-const cd = Math.cos(d), sd = Math.sin(d);
-const vl = vxl * cd + vyl * sd, vt = -vxl * sd + vyl * cd;
-const sf = this.surf[k];
-let mu = sf === 0 ? 1.0 - this.wetW[k] * 0.22 : sf === 1 ? 0.9 : sf === 2 ? 0.6 : 0.52;
-const Fz = this.load[k];
-const wR = this.w[k] * P.R;
-const den = Math.max(Math.abs(vl), 1.0);
-const kappa = (wR - vl) / den;
-const alpha = Math.atan2(vt, Math.max(Math.abs(vl), 0.8));
-const sx = kappa / 0.11, sy = Math.tan(alpha) / 0.13;
-const sMag = Math.hypot(sx, sy);
-let F = 0;
-if (sMag > 1e-6) {
-const B = 1.35, C = 1.65, E = 0.2;
-const bs = B * sMag;
-const peak = Math.sin(C * Math.atan(B - E * (B - Math.atan(B))));
-F = mu * Fz * Math.sin(C * Math.atan(bs - E * (bs - Math.atan(bs)))) / peak;
+const duringGearShift = this.gearShiftCooldown > 0.12;
+let engineTorqueNm = engineTorque(Math.min(this.rpm, parameters.redline)) * this.throttle * (duringGearShift ? 0.1 : 1);
+if (this.rpm >= parameters.redline) engineTorqueNm *= 0.2;
+const driveTorqueNm = engineTorqueNm * transmissionRatio * parameters.final * 0.9 * (this.reverse ? -1 : 1);
+return driveTorqueNm;
 }
-let fl = sMag > 1e-6 ? F * sx / sMag : 0;
-let ft = sMag > 1e-6 ? -F * sy / sMag : 0;
-const lowS = clamp(1 - Math.abs(vl) / 1.5, 0, 1);
-ft = lerp(ft, -vt * Fz * 0.35, lowS * 0.7);
-const rr = (sf >= 2 ? (sf === 3 ? 0.11 : 0.045) : P.roll) * Fz * Math.sign(vl) * Math.min(Math.abs(vl), 1);
-let T = 0;
-if (front) T += driveT * 0.5;
-const bT = (front ? P.brakeF : P.brakeR) * this.brk + (front ? 0 : P.handbrake * this.hb);
-const wNew = this.w[k] + (T - fl * P.R) / P.Iw * subDt;
-const bw = bT / P.Iw * subDt;
-if (Math.abs(wNew) <= bw) this.w[k] = 0; else this.w[k] = wNew - Math.sign(wNew) * bw;
-const fxl = (fl - rr) * cd - ft * sd, fyl = (fl - rr) * sd + ft * cd;
-this.fx[k] += fxl / P.SUB; this.fy[k] += fyl / P.SUB;
-this.slip[k] = Math.hypot(wR - vl, vt);
-this.sn[k] = sMag;
+/** Normal force on each wheel after longitudinal and lateral load transfer. */
+updateWheelLoads() {
+const parameters = PHYS;
+const wheelbase = parameters.cgA + parameters.cgB, massKg = parameters.mass, gravity = parameters.g;
+const frontAxleLoad = massKg * gravity * parameters.cgB / wheelbase - massKg * this.forwardAcceleration * parameters.cgH / wheelbase;
+const rearAxleLoad = massKg * gravity * parameters.cgA / wheelbase + massKg * this.forwardAcceleration * parameters.cgH / wheelbase;
+const frontLoadTransfer = massKg * this.lateralAcceleration * parameters.cgH / 1.34 * 0.6, rearLoadTransfer = massKg * this.lateralAcceleration * parameters.cgH / 1.31 * 0.4;
+this.wheelNormalLoads[0] = Math.max(50, frontAxleLoad * 0.5 + frontLoadTransfer);
+this.wheelNormalLoads[1] = Math.max(50, frontAxleLoad * 0.5 - frontLoadTransfer);
+this.wheelNormalLoads[2] = Math.max(50, rearAxleLoad * 0.5 + rearLoadTransfer);
+this.wheelNormalLoads[3] = Math.max(50, rearAxleLoad * 0.5 - rearLoadTransfer);
+}
+/**
+* Calculate combined-slip tire forces and integrate the body and wheel motion.
+* Scratch typed arrays are reused to avoid allocations per frame.
+*/
+integrateVehicleDynamics(deltaTimeSeconds, driveTorqueNm) {
+const parameters = PHYS;
+const massKg = parameters.mass;
+const gravity = parameters.g;
+const tireSubstepDuration = deltaTimeSeconds / parameters.SUB;
+let netForwardForce = 0, netLateralForce = 0, netYawTorque = 0;
+for (let wheelIndex = 0; wheelIndex < 4; wheelIndex++) { this.wheelForwardForces[wheelIndex] = 0;
+this.wheelLateralForces[wheelIndex] = 0; }
+for (let substepIndex = 0; substepIndex < parameters.SUB; substepIndex++) {
+for (let wheelIndex = 0; wheelIndex < 4; wheelIndex++) {
+const isFrontWheel = wheelIndex < 2;
+const axleDistance = isFrontWheel ? parameters.cgA : -parameters.cgB;
+const wheelSideOffset = (wheelIndex & 1 ? 1 : -1) * (isFrontWheel ? 0.67 : 0.655);
+const wheelForwardSpeed = this.forwardVelocity - this.yawRate * wheelSideOffset, wheelSideSpeed = this.lateralVelocity + this.yawRate * axleDistance;
+const wheelSteeringAngle = isFrontWheel ? this.steeringAngle * (1 + (wheelIndex & 1 ? -1 : 1) * this.steeringAngle * 0.12) : 0;
+const steeringCosine = Math.cos(wheelSteeringAngle), steeringSine = Math.sin(wheelSteeringAngle);
+const tireForwardSpeed = wheelForwardSpeed * steeringCosine + wheelSideSpeed * steeringSine, tireSideSpeed = -wheelForwardSpeed * steeringSine + wheelSideSpeed * steeringCosine;
+const surfaceType = this.wheelSurfaceTypes[wheelIndex];
+let surfaceGrip = surfaceType === 0 ? 1.0 - this.wheelWetness[wheelIndex] * 0.22 : surfaceType === 1 ? 0.9 : surfaceType === 2 ? 0.6 : 0.52;
+const wheelLoad = this.wheelNormalLoads[wheelIndex];
+const wheelContactSpeed = this.wheelAngularVelocities[wheelIndex] * parameters.R;
+const slipDenominator = Math.max(Math.abs(tireForwardSpeed), 1.0);
+const longitudinalSlip = (wheelContactSpeed - tireForwardSpeed) / slipDenominator;
+const lateralSlipAngle = Math.atan2(tireSideSpeed, Math.max(Math.abs(tireForwardSpeed), 0.8));
+const longitudinalSlipScaled = longitudinalSlip / 0.11, lateralSlipScaled = Math.tan(lateralSlipAngle) / 0.13;
+const combinedSlip = Math.hypot(longitudinalSlipScaled, lateralSlipScaled);
+let tireGripForce = 0;
+if (combinedSlip > 1e-6) {
+const magicB = 1.35, magicC = 1.65, magicE = 0.2;
+const magicInput = magicB * combinedSlip;
+const peakGrip = Math.sin(magicC * Math.atan(magicB - magicE * (magicB - Math.atan(magicB))));
+tireGripForce = surfaceGrip * wheelLoad * Math.sin(magicC * Math.atan(magicInput - magicE * (magicInput - Math.atan(magicInput)))) / peakGrip;
+}
+let tireForwardForce = combinedSlip > 1e-6 ? tireGripForce * longitudinalSlipScaled / combinedSlip : 0;
+let tireSideForce = combinedSlip > 1e-6 ? -tireGripForce * lateralSlipScaled / combinedSlip : 0;
+const nearStopBlend = clamp(1 - Math.abs(tireForwardSpeed) / 1.5, 0, 1);
+tireSideForce = lerp(tireSideForce, -tireSideSpeed * wheelLoad * 0.35, nearStopBlend * 0.7);
+const rollingResistanceForce = (surfaceType >= 2 ? (surfaceType === 3 ? 0.11 : 0.045) : parameters.roll) * wheelLoad * Math.sign(tireForwardSpeed) * Math.min(Math.abs(tireForwardSpeed), 1);
+let wheelDriveTorque = 0;
+if (isFrontWheel) wheelDriveTorque += driveTorqueNm * 0.5;
+const wheelBrakeTorque = (isFrontWheel ? parameters.brakeF : parameters.brakeR) * this.brake + (isFrontWheel ? 0 : parameters.handbrake * this.handbrake);
+const unbrakedWheelSpeed = this.wheelAngularVelocities[wheelIndex] + (wheelDriveTorque - tireForwardForce * parameters.R) / parameters.Iw * tireSubstepDuration;
+const brakeAngularDelta = wheelBrakeTorque / parameters.Iw * tireSubstepDuration;
+if (Math.abs(unbrakedWheelSpeed) <= brakeAngularDelta) this.wheelAngularVelocities[wheelIndex] = 0; else this.wheelAngularVelocities[wheelIndex] = unbrakedWheelSpeed - Math.sign(unbrakedWheelSpeed) * brakeAngularDelta;
+const forwardTireForce = (tireForwardForce - rollingResistanceForce) * steeringCosine - tireSideForce * steeringSine, sideTireForce = (tireForwardForce - rollingResistanceForce) * steeringSine + tireSideForce * steeringCosine;
+this.wheelForwardForces[wheelIndex] += forwardTireForce / parameters.SUB;
+this.wheelLateralForces[wheelIndex] += sideTireForce / parameters.SUB;
+this.slip[wheelIndex] = Math.hypot(wheelContactSpeed - tireForwardSpeed, tireSideSpeed);
+this.normalizedTireSlip[wheelIndex] = combinedSlip;
 }
 }
-for (let k = 0; k < 4; k++) {
-const front = k < 2;
-const a = front ? P.cgA : -P.cgB, b = (k & 1 ? 1 : -1) * (front ? 0.67 : 0.655);
-Fx += this.fx[k]; Fy += this.fy[k];
-Mz += a * this.fy[k] - b * this.fx[k];
+for (let wheelIndex = 0; wheelIndex < 4; wheelIndex++) {
+const isFrontWheel = wheelIndex < 2;
+const axleDistance = isFrontWheel ? parameters.cgA : -parameters.cgB, wheelSideOffset = (wheelIndex & 1 ? 1 : -1) * (isFrontWheel ? 0.67 : 0.655);
+netForwardForce += this.wheelForwardForces[wheelIndex]; netLateralForce += this.wheelLateralForces[wheelIndex];
+netYawTorque += axleDistance * this.wheelLateralForces[wheelIndex] - wheelSideOffset * this.wheelForwardForces[wheelIndex];
 }
-const sp = Math.hypot(this.u, this.v);
-Fx -= P.dragK * this.u * sp; Fy -= P.dragK * this.v * sp * 1.5;
-Fx -= m * g * Math.sin(this.pitchG);
-Fy += m * g * Math.sin(this.rollG) * 0.0;
-const axl = Fx / m, ayl = Fy / m;
-this.u += (axl + this.r * this.v) * dt;
-this.v += (ayl - this.r * this.u) * dt;
-this.r += Mz / P.Iz * dt;
-this.ax = lerp(this.ax, axl, 0.25); this.ay = lerp(this.ay, ayl + this.r * this.u * 0, 0.25);
-this.ay = lerp(this.ay, ayl, 0.0);
-const c = Math.cos(this.psi), sn = Math.sin(this.psi);
-this.x += (c * this.u - sn * this.v) * dt;
-this.z += (sn * this.u + c * this.v) * dt;
-this.psi += this.r * dt;
-for (let k = 0; k < 4; k++) this.spin[k] = (this.spin[k] + this.w[k] * dt) % TAU;
+const totalSpeed = Math.hypot(this.forwardVelocity, this.lateralVelocity);
+netForwardForce -= parameters.dragK * this.forwardVelocity * totalSpeed; netLateralForce -= parameters.dragK * this.lateralVelocity * totalSpeed * 1.5;
+netForwardForce -= massKg * gravity * Math.sin(this.roadPitch);
+netLateralForce += massKg * gravity * Math.sin(this.roadRoll) * 0.0;
+const forwardAcceleration = netForwardForce / massKg, sideAcceleration = netLateralForce / massKg;
+this.forwardVelocity += (forwardAcceleration + this.yawRate * this.lateralVelocity) * deltaTimeSeconds;
+this.lateralVelocity += (sideAcceleration - this.yawRate * this.forwardVelocity) * deltaTimeSeconds;
+this.yawRate += netYawTorque / parameters.Iz * deltaTimeSeconds;
+this.forwardAcceleration = lerp(this.forwardAcceleration, forwardAcceleration, 0.25);
+this.lateralAcceleration = lerp(this.lateralAcceleration, sideAcceleration + this.yawRate * this.forwardVelocity * 0, 0.25);
+this.lateralAcceleration = lerp(this.lateralAcceleration, sideAcceleration, 0.0);
+const headingCosine = Math.cos(this.headingRadians), headingSine = Math.sin(this.headingRadians);
+this.x += (headingCosine * this.forwardVelocity - headingSine * this.lateralVelocity) * deltaTimeSeconds;
+this.z += (headingSine * this.forwardVelocity + headingCosine * this.lateralVelocity) * deltaTimeSeconds;
+this.headingRadians += this.yawRate * deltaTimeSeconds;
+for (let wheelIndex = 0; wheelIndex < 4; wheelIndex++) this.wheelSpinAngles[wheelIndex] = (this.wheelSpinAngles[wheelIndex] + this.wheelAngularVelocities[wheelIndex] * deltaTimeSeconds) % TAU;
 this.updateGround();
 this.collide();
-const ayT = ayl, axT = axl;
-const rollT = -ayT * 0.0125, pitchT = axT * 0.0058;
-this.rollV += ((rollT - this.roll) * 90 - this.rollV * 11) * dt; this.roll += this.rollV * dt;
-this.pitchV += ((pitchT - this.pitch) * 110 - this.pitchV * 13) * dt; this.pitch += this.pitchV * dt;
-this.heaveV += ((0 - this.heave) * 160 - this.heaveV * 16) * dt; this.heave += this.heaveV * dt;
-this.time += dt;
+const sideAccelerationForBody = sideAcceleration, forwardAccelerationForBody = forwardAcceleration;
+const targetBodyRoll = -sideAccelerationForBody * 0.0125, targetBodyPitch = forwardAccelerationForBody * 0.0058;
+this.rollVelocity += ((targetBodyRoll - this.roll) * 90 - this.rollVelocity * 11) * deltaTimeSeconds;
+this.roll += this.rollVelocity * deltaTimeSeconds;
+this.pitchVelocity += ((targetBodyPitch - this.pitch) * 110 - this.pitchVelocity * 13) * deltaTimeSeconds;
+this.pitch += this.pitchVelocity * deltaTimeSeconds;
+this.heaveVelocity += ((0 - this.heave) * 160 - this.heaveVelocity * 16) * deltaTimeSeconds;
+this.heave += this.heaveVelocity * deltaTimeSeconds;
+this.elapsedSeconds += deltaTimeSeconds;
 }
+/** Resolve barrier penetration, bounce and frictional impact impulses. */
 collide() {
-const T = TRACK, o = this._p;
-const c = Math.cos(this.psi), sn = Math.sin(this.psi);
-this.wallHit = 0;
+const T = TRACK, o = this._trackProjection;
+const c = Math.cos(this.headingRadians), sn = Math.sin(this.headingRadians);
+this.wallImpactSpeed = 0;
 for (let k = 0; k < 4; k++) {
 const a = k < 2 ? 1.85 : -1.83, b = (k & 1 ? 1 : -1) * 0.78;
 const x = this.x + c * a - sn * b, z = this.z + sn * a + c * b;
-T.project(x, z, this.hint, o);
+T.project(x, z, this.trackSegmentHint, o);
 const s = o[0], u = o[1];
 const wall = (u > 0 ? T.lerpArr(T.wallR, s) : T.lerpArr(T.wallL, s)) - 0.35;
 const pen = Math.abs(u) - wall;
@@ -2220,10 +2325,11 @@ if (pen > 0) {
 const i = o[2] | 0;
 const rx = -T.tz[i], rz = T.tx[i];
 const nx = -Math.sign(u) * rx, nz = -Math.sign(u) * rz;
-this.x += nx * pen; this.z += nz * pen;
-const vxw = c * this.u - sn * this.v, vzw = sn * this.u + c * this.v;
+this.x += nx * pen;
+this.z += nz * pen;
+const vxw = c * this.forwardVelocity - sn * this.lateralVelocity, vzw = sn * this.forwardVelocity + c * this.lateralVelocity;
 const rxp = x - this.x, rzp = z - this.z;
-const pvx = vxw - this.r * rzp, pvz = vzw + this.r * rxp;
+const pvx = vxw - this.yawRate * rzp, pvz = vzw + this.yawRate * rxp;
 const vn = pvx * nx + pvz * nz;
 if (vn < 0) {
 const rn = rxp * nz - rzp * nx;
@@ -2233,10 +2339,10 @@ const tx = -nz, tz = nx, vt = pvx * tx + pvz * tz;
 const jt = clamp(-vt / (1 / PHYS.mass + 1 / PHYS.Iz), -0.4 * j, 0.4 * j);
 ix += jt * tx; iz += jt * tz;
 const dvx = ix / PHYS.mass, dvz = iz / PHYS.mass;
-this.u += c * dvx + sn * dvz;
-this.v += -sn * dvx + c * dvz;
-this.r += (rxp * iz - rzp * ix) / PHYS.Iz;
-this.wallHit = Math.max(this.wallHit, -vn);
+this.forwardVelocity += c * dvx + sn * dvz;
+this.lateralVelocity += -sn * dvx + c * dvz;
+this.yawRate += (rxp * iz - rzp * ix) / PHYS.Iz;
+this.wallImpactSpeed = Math.max(this.wallImpactSpeed, -vn);
 }
 }
 }
@@ -2288,7 +2394,7 @@ const inp = { up: false, down: false, left: false, right: false, hand: false };
 A.inp = inp;
 const tmp = new Float64Array(6);
 A.drive = (car, speedScale) => {
-const s = car.s, v = car.u;
+const s = car.trackDistance, v = car.forwardVelocity;
 const i = Math.floor(s / T.ds) % N;
 let vt = 1e9;
 for (let k = 0; k < 10; k++) vt = Math.min(vt, vmax[(i + k) % N]);
@@ -2296,18 +2402,18 @@ vt *= speedScale;
 const Ld = 5 + Math.abs(v) * 0.42;
 const j = (i + Math.round(Ld / T.ds)) % N;
 const dx = px[j] - car.x, dz = pz[j] - car.z;
-const c = Math.cos(car.psi), sn = Math.sin(car.psi);
+const c = Math.cos(car.headingRadians), sn = Math.sin(car.headingRadians);
 const la = dx * c + dz * sn, lb = -dx * sn + dz * c;
 const alpha = Math.atan2(lb, la);
 let delta = Math.atan(2 * 2.36 * Math.sin(alpha) / Math.hypot(dx, dz));
-delta -= car.r * 0.03;
+delta -= car.yawRate * 0.03;
 const lock = PHYS.maxSteer / (1 + Math.abs(v) * 0.045);
 const want = clamp(delta / lock, -1, 1);
 const db = 0.03;
 inp.left = false; inp.right = false;
-if (car.steerIn < want - db) inp.right = true;
-else if (car.steerIn > want + db) inp.left = true;
-else if (Math.abs(want) > 0.06) { if (want > 0) inp.right = car.steerIn < want; else inp.left = car.steerIn > want; }
+if (car.steeringInput < want - db) inp.right = true;
+else if (car.steeringInput > want + db) inp.left = true;
+else if (Math.abs(want) > 0.06) { if (want > 0) inp.right = car.steeringInput < want; else inp.left = car.steeringInput > want; }
 inp.up = false; inp.down = false; inp.hand = false;
 if (v < vt - 0.3) inp.up = true;
 else if (v > vt + 1.2) inp.down = true;
@@ -2416,13 +2522,13 @@ vel[i * 3] = vx * 0.25 + (rng() - 0.5) * 1.2; vel[i * 3 + 1] = 0.5 + rng() * 0.7
 age[i] = 0; life[i] = 1.3 + rng() * 1.2 * strength; seedA[i] = rng() * 100; sz0[i] = 0.25 + rng() * 0.25;
 }
 F.simStep = (car, dt) => {
-const c = Math.cos(car.psi), s = Math.sin(car.psi);
-const vxw = c * car.u - s * car.v, vzw = s * car.u + c * car.v;
+const c = Math.cos(car.headingRadians), s = Math.sin(car.headingRadians);
+const vxw = c * car.forwardVelocity - s * car.lateralVelocity, vzw = s * car.forwardVelocity + c * car.lateralVelocity;
 for (let k = 0; k < 4; k++) {
 const sl = car.slip[k];
-const surf = car.surf[k];
-const x = car.wx[k], z = car.wz[k], y = car.wy[k] + 0.012;
-const marking = sl > 2.2 && surf <= 1 && Math.abs(car.u) > 1.0 && car.wetW[k] < 0.3;
+const surf = car.wheelSurfaceTypes[k];
+const x = car.wheelWorldX[k], z = car.wheelWorldZ[k], y = car.wheelWorldY[k] + 0.012;
+const marking = sl > 2.2 && surf <= 1 && Math.abs(car.forwardVelocity) > 1.0 && car.wheelWetness[k] < 0.3;
 if (marking) {
 const inten = clamp((sl - 2.2) / 5, 0.15, 1);
 if (!lastOn[k]) { last[k * 3] = x; last[k * 3 + 1] = y; last[k * 3 + 2] = z; lastOn[k] = 1; }
@@ -2431,7 +2537,7 @@ const d = Math.hypot(x - last[k * 3], z - last[k * 3 + 2]);
 if (d > 0.3) { addSeg(k, x, y, z, inten); last[k * 3] = x; last[k * 3 + 1] = y; last[k * 3 + 2] = z; lastOn[k] = 2; }
 }
 } else lastOn[k] = 0;
-const smokeAmt = (Math.abs(car.u) < 7 || (car.brk < 0.7 && car.hb < 0.3) ? 0 : 1) * (surf <= 1 ? clamp((sl - 9.0) / 8, 0, 1) : clamp((Math.abs(car.u) - 3) / 15, 0, 1) * 0.6) * (1 - clamp(car.wetW[k] * 3, 0, 1));
+const smokeAmt = (Math.abs(car.forwardVelocity) < 7 || (car.brake < 0.7 && car.handbrake < 0.3) ? 0 : 1) * (surf <= 1 ? clamp((sl - 9.0) / 8, 0, 1) : clamp((Math.abs(car.forwardVelocity) - 3) / 15, 0, 1) * 0.6) * (1 - clamp(car.wheelWetness[k] * 3, 0, 1));
 if (smokeAmt > 0) {
 emitAcc[k] += smokeAmt * 75 * dt;
 while (emitAcc[k] >= 1) { emitAcc[k] -= 1; emit(x, y, z, vxw, vzw, smokeAmt); }
@@ -3244,34 +3350,34 @@ S.reset();
 S.simStep = (car, dt) => {
 const P = PHYS;
 let tg = car.rpm;
-if (car.gear === 1 || car.reverse) { const sl = P.idle + car.thr * 1900; if (sl > tg) tg = sl; }
+if (car.gear === 1 || car.reverse) { const sl = P.idle + car.throttle * 1900; if (sl > tg) tg = sl; }
 if (tg > 6700) tg = 6700;
 M[0] += (tg - M[0]) * (tg > M[0] ? 0.15 : 0.11);
-let ld = car.thr * (car.shiftT > 0.12 ? 0.1 : 1);
-if (car.rpm >= P.redline && ((car.time * 21) % 1) < 0.45) ld *= 0.2;
+let ld = car.throttle * (car.gearShiftCooldown > 0.12 ? 0.1 : 1);
+if (car.rpm >= P.redline && ((car.elapsedSeconds * 21) % 1) < 0.45) ld *= 0.2;
 const il = 0.28 * (1 - clamp((M[0] - 1000) / 900, 0, 1));
 if (ld < il) ld = il;
 M[1] += (ld - M[1]) * 0.25;
 let aF = 0, aR = 0, pF = 0, pR = 0, off = 0, kerb = 0, sv = 0;
 for (let k = 0; k < 4; k++) {
-const sf = car.surf[k];
+const sf = car.wheelSurfaceTypes[k];
 if (sf > 1) { off += 0.25; continue; }
 if (sf === 1) kerb += 0.5;
 const sl = car.slip[k];
-const q = clamp((car.sn[k] - 0.9) / 0.9, 0, 1) * clamp((sl - 0.8) / 2.5, 0, 1) * (0.25 + 0.75 * clamp(sl / 26, 0, 1)) * clamp(car.load[k] / 2100, 0.25, 1.2) * (1 - car.wetW[k] * 0.6);
+const q = clamp((car.normalizedTireSlip[k] - 0.9) / 0.9, 0, 1) * clamp((sl - 0.8) / 2.5, 0, 1) * (0.25 + 0.75 * clamp(sl / 26, 0, 1)) * clamp(car.wheelNormalLoads[k] / 2100, 0.25, 1.2) * (1 - car.wheelWetness[k] * 0.6);
 const sd = k & 1 ? 1 : -1;
 if (k < 2) { if (q > aF) aF = q; pF += sd * q; } else { if (q > aR) aR = q; pR += sd * q; }
 if (q > 0 && sl > sv) sv = sl;
 }
 M[2] = aF > 1 ? 1 : aF; M[3] = aR > 1 ? 1 : aR; M[4] = clamp(pF * 0.6, -0.6, 0.6); M[5] = clamp(pR * 0.6, -0.6, 0.6);
-M[6] = Math.hypot(car.u, car.v); M[7] = off; M[8] = kerb > 1 ? 1 : kerb; M[14] = sv;
+M[6] = Math.hypot(car.forwardVelocity, car.lateralVelocity); M[7] = off; M[8] = kerb > 1 ? 1 : kerb; M[14] = sv;
 const nx = clamp(car.x, -150, -15), dx = nx - car.x, dz = 20 - car.z, d2 = dx * dx + dz * dz;
 M[9] = 1 / (1 + d2 / 1100);
-M[10] = (-Math.sin(car.psi) * dx + Math.cos(car.psi) * dz) / (Math.sqrt(d2) + 1) * 0.7;
+M[10] = (-Math.sin(car.headingRadians) * dx + Math.cos(car.headingRadians) * dz) / (Math.sqrt(d2) + 1) * 0.7;
 const g = car.reverse ? -1 : car.gear;
 M[12] *= 0.72; M[13] *= 0.9;
 if (g !== M[11]) { M[11] = g; M[12] = 1; }
-const wh = car.wallHit > 14 ? 1.6 : car.wallHit / 9;
+const wh = car.wallImpactSpeed > 14 ? 1.6 : car.wallImpactSpeed / 9;
 if (wh > M[13]) M[13] = wh;
 };
 const gain = (ac, v) => { const g = ac.createGain(); g.gain.value = v; return g; };
@@ -3478,8 +3584,8 @@ const V = build(oc, opt);
 const reg = {}; for (const k of ['rpm', 'rpmSom', 'marcha', 'carga', 'acel', 'kmh', 'pneuD', 'pneuT', 'snD', 'snT', 'escD', 'escT', 'publico', 'x', 'z']) reg[k] = new Float32Array(n);
 for (let i = 0; i < n; i++) {
 G.simFrame(1 / 60);
-reg.rpm[i] = car.rpm; reg.rpmSom[i] = M[0]; reg.marcha[i] = car.gear; reg.carga[i] = M[1]; reg.acel[i] = car.thr; reg.kmh[i] = car.u * 3.6;
-reg.pneuD[i] = M[2]; reg.pneuT[i] = M[3]; reg.snD[i] = Math.max(car.sn[0], car.sn[1]); reg.snT[i] = Math.max(car.sn[2], car.sn[3]);
+reg.rpm[i] = car.rpm; reg.rpmSom[i] = M[0]; reg.marcha[i] = car.gear; reg.carga[i] = M[1]; reg.acel[i] = car.throttle; reg.kmh[i] = car.forwardVelocity * 3.6;
+reg.pneuD[i] = M[2]; reg.pneuT[i] = M[3]; reg.snD[i] = Math.max(car.normalizedTireSlip[0], car.normalizedTireSlip[1]); reg.snT[i] = Math.max(car.normalizedTireSlip[2], car.normalizedTireSlip[3]);
 reg.escD[i] = Math.max(car.slip[0], car.slip[1]); reg.escT[i] = Math.max(car.slip[2], car.slip[3]); reg.publico[i] = M[9]; reg.x[i] = car.x; reg.z[i] = car.z;
 apply(V, i / 60, false);
 }
@@ -3564,7 +3670,7 @@ g.beginPath(); g.moveTo((cx - c * r * 0.16) | 0, (cy - s * r * 0.16) | 0); g.lin
 g.beginPath(); g.arc(cx | 0, cy | 0, (r * 0.085) | 0, 0, 7); g.fill();
 }
 H.draw = (car, LT) => {
-const kmh = Math.abs(car.u) * 3.6, rpm = SND.M[0], gear = car.reverse ? 13 : car.gear;
+const kmh = Math.abs(car.forwardVelocity) * 3.6, rpm = SND.M[0], gear = car.reverse ? 13 : car.gear;
 const k10 = (kmh * 4) | 0, r10 = (rpm / 12) | 0;
 if (k10 !== L[0] || r10 !== L[1] || gear !== L[2]) {
 L[0] = k10; L[1] = r10; L[2] = gear;
@@ -3602,63 +3708,66 @@ return H;
 })();
 
 const GAME = (() => {
-const G = {};
+const gameController = {};
 const params = new URLSearchParams(location.search);
 const msgEl = document.getElementById('msg');
 const msg = (t) => { msgEl.textContent = t; msgEl.style.display = t ? 'flex' : 'none'; };
-G.params = params;
-G.ready = false;
-const UION = params.has('ui') || !(params.has('manual') || params.has('replay') || params.has('perf'));
+gameController.params = params;
+gameController.ready = false;
+const interfaceEnabled = params.has('ui') || !(params.has('manual') || params.has('replay') || params.has('perf'));
 const $ = (id) => document.getElementById(id);
-const fs = { cam: { x: 0, y: 5, z: 10, tx: 0, ty: 0, tz: 0, fovy: 0.75 }, time: 0, dt: 1 / 60, taa: true, hud: !params.has('nohud') && !UION, cubeCenter: null,
+const renderFrameState = { cam: { x: 0, y: 5, z: 10, tx: 0, ty: 0, tz: 0, fovy: 0.75 }, time: 0, dt: 1 / 60, taa: true, hud: !params.has('nohud') && !interfaceEnabled, cubeCenter: null,
 speedKmh: 0, lapTime: 0, camIndex: 0, motionBlur: 1, allShadows: false, allCubeFaces: false, cut: true };
-G.frameState = fs;
-const car = new Car();
-G.car = car;
+gameController.frameState = renderFrameState;
+const car = new VehiclePhysics();
+gameController.car = car;
 const input = { up: false, down: false, left: false, right: false, hand: false, analog: false, stick: false, a: new Float64Array(3) };
 const keysDown = { up: false, down: false, left: false, right: false, hand: false };
-G.input = keysDown;
-G.mode = params.has('replay') || params.has('perf') ? 'replay' : 'play';
-G.camMode = 0;             // 0 perseguição, 1 capô, 2 TV
-G.debugCam = false;
-const F = new Float64Array(8);   // 0 simTime, 1 acc, 2 lapStart, 3 lastS, 4 lapDist, 5 lastT, 6 lastFrameT
+gameController.input = keysDown;
+gameController.mode = params.has('replay') || params.has('perf') ? 'replay' : 'play';
+gameController.camMode = 0;             // 0 perseguição, 1 capô, 2 TV
+gameController.debugCam = false;
+const CLOCK_SLOT = Object.freeze({ SIMULATION_SECONDS: 0, FIXED_STEP_ACCUMULATOR: 1, LAP_START_SECONDS: 2, PREVIOUS_TRACK_DISTANCE: 3, TOTAL_TRACK_DISTANCE: 4, PREVIOUS_RAF_MS: 5, PREVIOUS_PERF_MS: 6, DELTA_SECONDS: 7 });
+const simulationClock = new Float64Array(8);
 let simFrame = 0, lapRunning = true;
 const CAM_NAMES = ['perseguição', 'capô', 'TV'];
-const UI = { on: UION, screen: UION ? 'inicio' : 'jogo', stats: false, pose: 0, bench: false, watch: false, result: null };
-G.ui = UI;
-let paused = UION, frozen = false, hudOn = false;
-const LT = new Float64Array(8);
-const lapReset = () => { LT[0] = 0; LT[3] = 0; LT[4] = 0; LT[5] = 0; LT[6] = 0; };
-LT[1] = -1; LT[2] = -1;
-const ST = new Float64Array(8);
+const userInterface = { on: interfaceEnabled, screen: interfaceEnabled ? 'inicio' : 'jogo', stats: false, pose: 0, bench: false, watch: false, result: null };
+gameController.ui = userInterface;
+let paused = interfaceEnabled, frozen = false, hudOn = false;
+const LAP_SLOT = Object.freeze({ CURRENT_SECONDS: 0, LAST_SECONDS: 1, BEST_SECONDS: 2, START_SECONDS: 3, DISTANCE_SINCE_LINE: 4, STARTED: 5, PLAYER_LAP: 6, COMPLETED_LAPS: 7 });
+const lapTiming = new Float64Array(8);
+const lapReset = () => { lapTiming[LAP_SLOT.CURRENT_SECONDS] = 0; lapTiming[LAP_SLOT.START_SECONDS] = 0; lapTiming[LAP_SLOT.DISTANCE_SINCE_LINE] = 0; lapTiming[LAP_SLOT.STARTED] = 0; lapTiming[LAP_SLOT.PLAYER_LAP] = 0; };
+lapTiming[LAP_SLOT.LAST_SECONDS] = -1; lapTiming[LAP_SLOT.BEST_SECONDS] = -1;
+const HUD_SLOT = Object.freeze({ FPS: 0, FRAME_MS: 1, GPU_MS: 2, SAMPLE_SECONDS: 3, SAMPLE_FRAMES: 4, NOTICE_HIDE_SECONDS: 5, UNUSED_6: 6, UNUSED_7: 7 });
+const hudMetrics = new Float64Array(8);
 const SCHED = [[0, 0], [13.2, 2], [24.5, 0], [37.5, 1], [47.5, 0]];   // câmeras da volta roteirizada (as do vídeo)
 const KEYMAP = { KeyW: 'up', ArrowUp: 'up', KeyS: 'down', ArrowDown: 'down', KeyA: 'left', ArrowLeft: 'left', KeyD: 'right', ArrowRight: 'right', Space: 'hand' };
 let lookKey = false, padLook = false, padHand = false, stickLast = false, padN = 0;
 function drive() {
-if (G.mode === 'replay' && (G.takeOverOnKey || UI.watch)) takeOver();
-if (UI.pose) leavePose();
+if (gameController.mode === 'replay' && (gameController.takeOverOnKey || userInterface.watch)) takeOver();
+if (userInterface.pose) leavePose();
 }
 function takeOver() {
-G.mode = 'play';
-if (UI.watch) { UI.watch = false; G.camSchedule = null; G.camMode = 0; camInit = false; fs.cut = true; say('Você no controle'); }
+gameController.mode = 'play';
+if (userInterface.watch) { userInterface.watch = false; gameController.camSchedule = null; gameController.camMode = 0; camInit = false; renderFrameState.cut = true; say('Você no controle'); }
 }
 function camKey() {
-if (UI.bench) return;
-if (UI.pose) { leavePose(); return; }
-if (UI.watch) G.camSchedule = null;
-G.cycleCamera();
-if (UI.on) say('Câmera: ' + CAM_NAMES[G.camMode]);
+if (userInterface.bench) return;
+if (userInterface.pose) { leavePose(); return; }
+if (userInterface.watch) gameController.camSchedule = null;
+gameController.cycleCamera();
+if (userInterface.on) say('Câmera: ' + CAM_NAMES[gameController.camMode]);
 }
 function resetKey() {
-if (UI.bench) return;
-if (UI.pose) leavePose();
-if (UI.watch) takeOver();
-G.resetCar();
+if (userInterface.bench) return;
+if (userInterface.pose) leavePose();
+if (userInterface.watch) takeOver();
+gameController.resetCar();
 }
 function onKey(e, down) {
 if (e.ctrlKey || e.metaKey || e.altKey) return;
 const c = e.code;
-if (UI.on && paused) {       // menus: só Esc, M, H e B; Enter/Espaço ficam com o botão em foco
+if (userInterface.on && paused) {       // menus: só Esc, M, H e B; Enter/Espaço ficam com o botão em foco
 if (down && !e.repeat && uiKey(c)) e.preventDefault();
 return;
 }
@@ -3668,19 +3777,19 @@ if (c === 'KeyV') lookKey = down;
 if (down && !e.repeat) {
 if (c === 'KeyC') camKey();
 else if (c === 'KeyR') resetKey();
-else if (UI.on && uiKey(c)) e.preventDefault();
+else if (userInterface.on && uiKey(c)) e.preventDefault();
 }
 }
 function uiKey(c) {
-if (c === 'Escape') { if (UI.screen === 'jogo') G.pause(); else G.resume(); }
+if (c === 'Escape') { if (userInterface.screen === 'jogo') gameController.pause(); else gameController.resume(); }
 else if (c === 'KeyM') { SND.setMute(!SND.muted); say(SND.muted ? 'Som desligado' : 'Som ligado'); }
-else if (c === 'KeyH') { UI.stats = !UI.stats; RENDER.tsLive = UI.stats; ST[3] = 0; ST[4] = 0; hudVis(); }
-else if (UI.screen === 'inicio') return false;
-else if (c === 'KeyB') G.startBench();
+else if (c === 'KeyH') { userInterface.stats = !userInterface.stats; RENDER.tsLive = userInterface.stats; hudMetrics[HUD_SLOT.SAMPLE_SECONDS] = 0; hudMetrics[HUD_SLOT.SAMPLE_FRAMES] = 0; hudVis(); }
+else if (userInterface.screen === 'inicio') return false;
+else if (c === 'KeyB') gameController.startBench();
 else if (paused) return false;
-else if (c === 'KeyF') G.watchLap();
-else if (c.length === 6 && c.startsWith('Digit') && c[5] >= '1' && c[5] <= '6') G.gotoPose(+c[5]);
-else if (c.length === 7 && c.startsWith('Numpad') && c[6] >= '1' && c[6] <= '6') G.gotoPose(+c[6]);
+else if (c === 'KeyF') gameController.watchLap();
+else if (c.length === 6 && c.startsWith('Digit') && c[5] >= '1' && c[5] <= '6') gameController.gotoPose(+c[5]);
+else if (c.length === 7 && c.startsWith('Numpad') && c[6] >= '1' && c[6] <= '6') gameController.gotoPose(+c[6]);
 else return false;
 return true;
 }
@@ -3709,9 +3818,9 @@ const bt = nb > 7 - j ? b[7 - j] : null, v = bt ? (bt.value > 0 ? bt.value : bt.
 PADV[1 + j] = v < 0.04 ? 0 : v > 0.96 ? 1 : (v - 0.04) / 0.92;
 }
 for (let i = 0; i < 17; i++) { padWas[i] = padNow[i]; padNow[i] = i < nb && b[i].pressed ? 1 : 0; }
-if (UI.on && paused) {
+if (userInterface.on && paused) {
 padHand = padLook = false;
-if (hit(9) || hit(0)) { if (UI.screen === 'inicio') G.start(); else G.resume(); }
+if (hit(9) || hit(0)) { if (userInterface.screen === 'inicio') gameController.start(); else gameController.resume(); }
 return;
 }
 padHand = padNow[0] === 1; padLook = padNow[5] === 1;
@@ -3719,28 +3828,28 @@ if (PADV[0] !== 0) stickLast = true;
 if (PADV[1] > 0.1 || PADV[2] > 0.1 || Math.abs(PADV[0]) > 0.25 || padHand) drive();
 if (hit(3)) camKey();
 if (hit(2)) resetKey();
-if (hit(9) && UI.on) G.pause();
+if (hit(9) && userInterface.on) gameController.pause();
 }
-G.cycleCamera = () => { G.camMode = (G.camMode + 1) % 3; camInit = false; fs.cut = true; G.debugCam = false; };
+gameController.cycleCamera = () => { gameController.camMode = (gameController.camMode + 1) % 3; camInit = false; renderFrameState.cut = true; gameController.debugCam = false; };
 const tmp3 = new Float64Array(3);
-G.resetCar = () => {
+gameController.resetCar = () => {
 TRACK.project(car.x, car.z, -1, tmp3);
 car.placeOnTrack(tmp3[0], clamp(tmp3[1], -3, 3));
-copyPrev(); camInit = false; fs.cut = true;
+copyPrev(); camInit = false; renderFrameState.cut = true;
 };
 const pose = { x: 0, y: 0, z: 0, fx: 1, fy: 0, fz: 0, ux: 0, uy: 1, uz: 0, roll: 0, pitch: 0, heave: 0, steer: 0, spin: new Float32Array(4), drop: new Float32Array(4), brake: 0, reverse: 0, lights: 0 };
-G.pose = pose;
-const prevSt = { x: 0, y: 0, z: 0, psi: 0, roll: 0, pitch: 0, pg: 0, rg: 0, spin: new Float64Array(4) };
+gameController.pose = pose;
+const previousCarPose = { x: 0, y: 0, z: 0, headingRadians: 0, roll: 0, pitch: 0, roadPitch: 0, roadRoll: 0, wheelSpinAngles: new Float64Array(4) };
 function copyPrev() {
-prevSt.x = car.x; prevSt.y = car.y; prevSt.z = car.z; prevSt.psi = car.psi; prevSt.roll = car.roll; prevSt.pitch = car.pitch;
-prevSt.pg = car.pitchG; prevSt.rg = car.rollG; for (let k = 0; k < 4; k++) prevSt.spin[k] = car.spin[k];
+previousCarPose.x = car.x; previousCarPose.y = car.y; previousCarPose.z = car.z; previousCarPose.headingRadians = car.headingRadians; previousCarPose.roll = car.roll; previousCarPose.pitch = car.pitch;
+previousCarPose.roadPitch = car.roadPitch; previousCarPose.roadRoll = car.roadRoll; for (let k = 0; k < 4; k++) previousCarPose.wheelSpinAngles[k] = car.wheelSpinAngles[k];
 }
 function angLerp(a, b, t) { let d = b - a; while (d > PI) d -= TAU; while (d < -PI) d += TAU; return a + d * t; }
 function updatePose() {
-const alpha = clamp(F[1] / PHYS.DT, 0, 1);
-const x = lerp(prevSt.x, car.x, alpha), y = lerp(prevSt.y, car.y, alpha), z = lerp(prevSt.z, car.z, alpha);
-const psi = angLerp(prevSt.psi, car.psi, alpha);
-const pg = lerp(prevSt.pg, car.pitchG, alpha), rg = lerp(prevSt.rg, car.rollG, alpha);
+const alpha = clamp(simulationClock[CLOCK_SLOT.FIXED_STEP_ACCUMULATOR] / PHYS.DT, 0, 1);
+const x = lerp(previousCarPose.x, car.x, alpha), y = lerp(previousCarPose.y, car.y, alpha), z = lerp(previousCarPose.z, car.z, alpha);
+const psi = angLerp(previousCarPose.headingRadians, car.headingRadians, alpha);
+const pg = lerp(previousCarPose.roadPitch, car.roadPitch, alpha), rg = lerp(previousCarPose.roadRoll, car.roadRoll, alpha);
 const c = Math.cos(psi), s = Math.sin(psi);
 const cp = Math.cos(pg), sp = Math.sin(pg);
 pose.fx = c * cp; pose.fy = sp; pose.fz = s * cp;
@@ -3750,11 +3859,11 @@ const cr = Math.cos(rg), sr = Math.sin(rg);
 pose.ux = ux * cr + rx * sr; pose.uy = uy * cr; pose.uz = uz * cr + rz * sr;
 const ul = Math.hypot(pose.ux, pose.uy, pose.uz); pose.ux /= ul; pose.uy /= ul; pose.uz /= ul;
 pose.x = x; pose.y = y; pose.z = z;
-pose.roll = lerp(prevSt.roll, car.roll, alpha); pose.pitch = lerp(prevSt.pitch, car.pitch, alpha); pose.heave = car.heave;
-pose.steer = car.steer;
-for (let k = 0; k < 4; k++) { pose.spin[k] = angLerp(prevSt.spin[k], car.spin[k], alpha); pose.drop[k] = 0; }
-pose.brake = car.brk > 0.05 ? 1 : 0;
-pose.reverse = car.reverse && car.thr > 0.05 ? 1 : 0;
+pose.roll = lerp(previousCarPose.roll, car.roll, alpha); pose.pitch = lerp(previousCarPose.pitch, car.pitch, alpha); pose.heave = car.heave;
+pose.steer = car.steeringAngle;
+for (let k = 0; k < 4; k++) { pose.spin[k] = angLerp(previousCarPose.wheelSpinAngles[k], car.wheelSpinAngles[k], alpha); pose.drop[k] = 0; }
+pose.brake = car.brake > 0.05 ? 1 : 0;
+pose.reverse = car.reverse && car.throttle > 0.05 ? 1 : 0;
 }
 let camInit = false;
 const ch = { x: 0, y: 0, z: 0, yaw: 0, tx: 0, ty: 0, tz: 0 };
@@ -3773,28 +3882,28 @@ const x = ts[0] - ts[4] * u, z = ts[2] + ts[3] * u;
 tvCams.push({ s: s0, x, y: TERRAIN.heightAt(x, z) + 4.2, z });
 }
 }
-G.tvCams = tvCams;
+gameController.tvCams = tvCams;
 let tvIdx = -1;
 function updateCamera() {
-const dt = F[7];
-const c = fs.cam;
+const dt = simulationClock[CLOCK_SLOT.DELTA_SECONDS];
+const c = renderFrameState.cam;
 const hx = pose.fx, hz = pose.fz, hl = Math.hypot(hx, hz) || 1;
 const fx = hx / hl, fz = hz / hl;
-const lb = G.lookBack ? -1 : 1;              // olhar para trás espelha a câmera (a de TV vira perseguição)
-if (G.camMode === 0 || (lb < 0 && G.camMode === 2)) {
+const lb = gameController.lookBack ? -1 : 1;              // olhar para trás espelha a câmera (a de TV vira perseguição)
+if (gameController.camMode === 0 || (lb < 0 && gameController.camMode === 2)) {
 const yawT = Math.atan2(fz, fx);
 if (!camInit) { ch.yaw = yawT; ch.y = pose.y; camInit = true; }
 ch.yaw = angLerp(ch.yaw, yawT, 1 - Math.exp(-dt * 3.6));
 ch.y += (pose.y - ch.y) * (1 - Math.exp(-dt * 8));
-const spd = Math.abs(car.u);
+const spd = Math.abs(car.forwardVelocity);
 const dist = 6.2 + spd * 0.035, h = 1.95;
 const cx = Math.cos(ch.yaw), cz = Math.sin(ch.yaw);
 c.x = pose.x - cx * dist * lb; c.z = pose.z - cz * dist * lb;
 c.y = Math.max(ch.y + h, TERRAIN.heightAt(c.x, c.z) + 0.6);
 c.tx = pose.x + cx * 1.5 * lb; c.ty = ch.y + 1.05; c.tz = pose.z + cz * 1.5 * lb;
 c.fovy = (44 + Math.min(spd, 40) * 0.12) * PI / 180;
-fs.camIndex = 0;
-} else if (G.camMode === 1) {
+renderFrameState.camIndex = 0;
+} else if (gameController.camMode === 1) {
 const rx = -fz, rz = fx;
 const ax = lb > 0 ? 0.58 : -2.0, ay = lb > 0 ? 1.25 : 1.0;
 c.x = pose.x + pose.fx * ax + pose.ux * ay; c.y = pose.y + pose.fy * ax + pose.uy * ay + pose.heave; c.z = pose.z + pose.fz * ax + pose.uz * ay;
@@ -3803,15 +3912,15 @@ c.tx = c.x + pose.fx * 20 * lb + pose.ux * (-1.9 + pit * 20) + rx * rol * 4;
 c.ty = c.y + pose.fy * 20 * lb + pose.uy * (-1.9 + pit * 20);
 c.tz = c.z + pose.fz * 20 * lb + pose.uz * (-1.9 + pit * 20) + rz * rol * 4;
 c.fovy = 52 * PI / 180;
-fs.camIndex = 1;
+renderFrameState.camIndex = 1;
 } else {
 let best = 0, bd = 1e9;
 for (let i = 0; i < tvCams.length; i++) {
-let d = car.s - tvCams[i].s; if (d < -TRACK.L / 2) d += TRACK.L; if (d > TRACK.L / 2) d -= TRACK.L;
+let d = car.trackDistance - tvCams[i].s; if (d < -TRACK.L / 2) d += TRACK.L; if (d > TRACK.L / 2) d -= TRACK.L;
 const ad = Math.abs(d - 15);
 if (ad < bd) { bd = ad; best = i; }
 }
-if (best !== tvIdx) { tvIdx = best; fs.cut = true; camInit = false; }
+if (best !== tvIdx) { tvIdx = best; renderFrameState.cut = true; camInit = false; }
 const tc = tvCams[best];
 c.x = tc.x; c.y = tc.y; c.z = tc.z;
 if (!camInit) { ch.tx = pose.x; ch.ty = pose.y + 0.7; ch.tz = pose.z; camInit = true; }
@@ -3820,23 +3929,23 @@ ch.tx += (pose.x - ch.tx) * k; ch.ty += (pose.y + 0.7 - ch.ty) * k; ch.tz += (po
 c.tx = ch.tx; c.ty = ch.ty; c.tz = ch.tz;
 const d = Math.hypot(c.tx - c.x, c.ty - c.y, c.tz - c.z);
 c.fovy = clamp(2 * Math.atan(5.0 / d), 7 * PI / 180, 50 * PI / 180);
-fs.camIndex = 2;
+renderFrameState.camIndex = 2;
 }
 }
 function orbitCamera() {
-const a = fs.time * 0.11 + 2.3, c = fs.cam;
+const a = renderFrameState.time * 0.11 + 2.3, c = renderFrameState.cam;
 c.x = pose.x + Math.cos(a) * 6.6; c.z = pose.z + Math.sin(a) * 6.6;
 c.y = Math.max(pose.y + 1.55, TERRAIN.heightAt(c.x, c.z) + 0.5);
-c.tx = pose.x; c.ty = pose.y + 0.72; c.tz = pose.z; c.fovy = 40 * PI / 180; fs.camIndex = 0;
+c.tx = pose.x; c.ty = pose.y + 0.72; c.tz = pose.z; c.fovy = 40 * PI / 180; renderFrameState.camIndex = 0;
 }
 function simStep() {
-if (G.mode === 'replay' && LAP.keys) {
+if (gameController.mode === 'replay' && LAP.keys) {
 const f = Math.floor(simFrame / 2);
 const k = f < LAP.keys.length ? LAP.keys[f] : 0;
 input.up = !!(k & 1); input.down = !!(k & 2); input.left = !!(k & 4); input.right = !!(k & 8); input.hand = !!(k & 16);
-if (f >= LAP.keys.length) { input.down = car.u > 0.5; }
+if (f >= LAP.keys.length) { input.down = car.forwardVelocity > 0.5; }
 input.analog = false;
-} else if (G.mode === 'ai') {
+} else if (gameController.mode === 'ai') {
 const a = AI.drive(car, 1.0);
 input.up = a.up; input.down = a.down; input.left = a.left; input.right = a.right; input.hand = a.hand;
 input.analog = false;
@@ -3850,81 +3959,81 @@ input.analog = true; input.stick = stickLast;
 copyPrev();
 car.step(input, PHYS.DT);
 simFrame++;
-F[0] += PHYS.DT;
-let ds = car.s - F[3]; if (ds < -TRACK.L / 2) ds += TRACK.L; if (ds > TRACK.L / 2) ds -= TRACK.L;
+simulationClock[CLOCK_SLOT.SIMULATION_SECONDS] += PHYS.DT;
+let ds = car.trackDistance - simulationClock[CLOCK_SLOT.PREVIOUS_TRACK_DISTANCE]; if (ds < -TRACK.L / 2) ds += TRACK.L; if (ds > TRACK.L / 2) ds -= TRACK.L;
 {
-let r0 = F[3] - TRACK.sStart; if (r0 > TRACK.L / 2) r0 -= TRACK.L; else if (r0 < -TRACK.L / 2) r0 += TRACK.L;
-LT[4] += ds;
-if (G.mode !== 'play') LT[6] = 0;
+let r0 = simulationClock[CLOCK_SLOT.PREVIOUS_TRACK_DISTANCE] - TRACK.sStart; if (r0 > TRACK.L / 2) r0 -= TRACK.L; else if (r0 < -TRACK.L / 2) r0 += TRACK.L;
+lapTiming[LAP_SLOT.DISTANCE_SINCE_LINE] += ds;
+if (gameController.mode !== 'play') lapTiming[LAP_SLOT.PLAYER_LAP] = 0;
 if (r0 < 0 && r0 + ds >= 0) {
-const tc = F[0] - PHYS.DT * (r0 + ds) / ds;
-if (LT[5] === 1 && LT[4] > TRACK.L * 0.9) { LT[1] = tc - LT[3]; LT[7]++; if (LT[6] === 1 && (LT[2] < 0 || LT[1] < LT[2])) LT[2] = LT[1]; }
-LT[3] = tc; LT[4] = r0 + ds; LT[5] = 1; LT[6] = G.mode === 'play' ? 1 : 0;
+const tc = simulationClock[CLOCK_SLOT.SIMULATION_SECONDS] - PHYS.DT * (r0 + ds) / ds;
+if (lapTiming[LAP_SLOT.STARTED] === 1 && lapTiming[LAP_SLOT.DISTANCE_SINCE_LINE] > TRACK.L * 0.9) { lapTiming[LAP_SLOT.LAST_SECONDS] = tc - lapTiming[LAP_SLOT.START_SECONDS]; lapTiming[LAP_SLOT.COMPLETED_LAPS]++; if (lapTiming[LAP_SLOT.PLAYER_LAP] === 1 && (lapTiming[LAP_SLOT.BEST_SECONDS] < 0 || lapTiming[LAP_SLOT.LAST_SECONDS] < lapTiming[LAP_SLOT.BEST_SECONDS])) lapTiming[LAP_SLOT.BEST_SECONDS] = lapTiming[LAP_SLOT.LAST_SECONDS]; }
+lapTiming[LAP_SLOT.START_SECONDS] = tc; lapTiming[LAP_SLOT.DISTANCE_SINCE_LINE] = r0 + ds; lapTiming[LAP_SLOT.STARTED] = 1; lapTiming[LAP_SLOT.PLAYER_LAP] = gameController.mode === 'play' ? 1 : 0;
 }
 }
-F[3] = car.s; F[4] += ds;
-if (F[4] >= TRACK.L - 8) { if (lapRunning) G.lastLap = F[0] - F[2]; else if (!G.lapCount) G.lapCount = 0; G.lapCount = (G.lapCount || 0) + 1; lapRunning = true; F[2] = F[0]; F[4] -= TRACK.L; if (G.lapCount > 1) G.lastLap2 = G.lastLap; }
+simulationClock[CLOCK_SLOT.PREVIOUS_TRACK_DISTANCE] = car.trackDistance; simulationClock[CLOCK_SLOT.TOTAL_TRACK_DISTANCE] += ds;
+if (simulationClock[CLOCK_SLOT.TOTAL_TRACK_DISTANCE] >= TRACK.L - 8) { if (lapRunning) gameController.lastLap = simulationClock[CLOCK_SLOT.SIMULATION_SECONDS] - simulationClock[CLOCK_SLOT.LAP_START_SECONDS]; else if (!gameController.lapCount) gameController.lapCount = 0; gameController.lapCount = (gameController.lapCount || 0) + 1; lapRunning = true; simulationClock[CLOCK_SLOT.LAP_START_SECONDS] = simulationClock[CLOCK_SLOT.SIMULATION_SECONDS]; simulationClock[CLOCK_SLOT.TOTAL_TRACK_DISTANCE] -= TRACK.L; if (gameController.lapCount > 1) gameController.lastLap2 = gameController.lastLap; }
 if (typeof FX !== 'undefined') FX.simStep(car, PHYS.DT);
 SND.simStep(car, PHYS.DT);
 }
-G.startScripted = () => {
-G.mode = 'replay';
+gameController.startScripted = () => {
+gameController.mode = 'replay';
 car.placeOnTrack(LAP.meta.startS, LAP.meta.startU);
-F[0] = 0; simFrame = 0; F[1] = 0; F[2] = 0; lapRunning = true; F[4] = 0; F[3] = car.s; G.lastLap = 0;
-copyPrev(); camInit = false; fs.cut = true;
+simulationClock[CLOCK_SLOT.SIMULATION_SECONDS] = 0; simFrame = 0; simulationClock[CLOCK_SLOT.FIXED_STEP_ACCUMULATOR] = 0; simulationClock[CLOCK_SLOT.LAP_START_SECONDS] = 0; lapRunning = true; simulationClock[CLOCK_SLOT.TOTAL_TRACK_DISTANCE] = 0; simulationClock[CLOCK_SLOT.PREVIOUS_TRACK_DISTANCE] = car.trackDistance; gameController.lastLap = 0;
+copyPrev(); camInit = false; renderFrameState.cut = true;
 if (typeof FX !== 'undefined') FX.reset();
 lapReset(); SND.reset();
 };
-G.advance = () => {
-F[1] += F[7];
+gameController.advance = () => {
+simulationClock[CLOCK_SLOT.FIXED_STEP_ACCUMULATOR] += simulationClock[CLOCK_SLOT.DELTA_SECONDS];
 let n = 0;
-while (F[1] >= PHYS.DT - 1e-9 && n < 24) { simStep(); F[1] -= PHYS.DT; n++; }
-if (n === 24) F[1] = 0;
+while (simulationClock[CLOCK_SLOT.FIXED_STEP_ACCUMULATOR] >= PHYS.DT - 1e-9 && n < 24) { simStep(); simulationClock[CLOCK_SLOT.FIXED_STEP_ACCUMULATOR] -= PHYS.DT; n++; }
+if (n === 24) simulationClock[CLOCK_SLOT.FIXED_STEP_ACCUMULATOR] = 0;
 };
-G.simFrame = (dt) => { F[7] = dt; G.advance(); };     // só a simulação, sem imagem (som fora do tempo real)
+gameController.simFrame = (dt) => { simulationClock[CLOCK_SLOT.DELTA_SECONDS] = dt; gameController.advance(); };     // só a simulação, sem imagem (som fora do tempo real)
 const cubeC = new Float32Array(3);
 function frame() {
-const dt = F[7];
-if (!paused && !frozen) G.advance();
-if (G.camSchedule) G.applySchedule();
+const dt = simulationClock[CLOCK_SLOT.DELTA_SECONDS];
+if (!paused && !frozen) gameController.advance();
+if (gameController.camSchedule) gameController.applySchedule();
 updatePose();
-CARGFX.update(pose, fs.cut);
-if (UI.screen === 'inicio') orbitCamera(); else if (!G.debugCam) updateCamera();
-cubeC[0] = pose.x; cubeC[1] = pose.y + 0.75; cubeC[2] = pose.z; fs.cubeCenter = cubeC;
-{ const hl = Math.hypot(pose.fx, pose.fz) || 1; fs.carFx = pose.fx / hl; fs.carFz = pose.fz / hl; }
-fs.dt = dt; fs.time += dt;
-fs.speedKmh = Math.abs(car.u) * 3.6;
-fs.lapTime = F[0] - F[2];
-if (typeof FX !== 'undefined') FX.frame(fs);
-RENDER.renderFrame(fs);
-fs.cut = false;
+CARGFX.update(pose, renderFrameState.cut);
+if (userInterface.screen === 'inicio') orbitCamera(); else if (!gameController.debugCam) updateCamera();
+cubeC[0] = pose.x; cubeC[1] = pose.y + 0.75; cubeC[2] = pose.z; renderFrameState.cubeCenter = cubeC;
+{ const hl = Math.hypot(pose.fx, pose.fz) || 1; renderFrameState.carFx = pose.fx / hl; renderFrameState.carFz = pose.fz / hl; }
+renderFrameState.dt = dt; renderFrameState.time += dt;
+renderFrameState.speedKmh = Math.abs(car.forwardVelocity) * 3.6;
+renderFrameState.lapTime = simulationClock[CLOCK_SLOT.SIMULATION_SECONDS] - simulationClock[CLOCK_SLOT.LAP_START_SECONDS];
+if (typeof FX !== 'undefined') FX.frame(renderFrameState);
+RENDER.renderFrame(renderFrameState);
+renderFrameState.cut = false;
 }
 function tick() {
 if (padN > 0) pollPad();
 const lb = lookKey || padLook;
-if (lb !== !!G.lookBack) { G.lookBack = lb; camInit = false; fs.cut = true; }
-if (!UI.on) { frame(); return; }
-if (UI.watch && G.mode === 'replay' && simFrame >= LAP.keys.length * 2 && Math.abs(car.u) < 0.5) takeOver();
+if (lb !== !!gameController.lookBack) { gameController.lookBack = lb; camInit = false; renderFrameState.cut = true; }
+if (!userInterface.on) { frame(); return; }
+if (userInterface.watch && gameController.mode === 'replay' && simFrame >= LAP.keys.length * 2 && Math.abs(car.forwardVelocity) < 0.5) takeOver();
 frame();
-LT[0] = LT[5] === 1 ? F[0] - LT[3] : 0;
-if (hudOn) HUD.draw(car, LT);
+lapTiming[LAP_SLOT.CURRENT_SECONDS] = lapTiming[LAP_SLOT.STARTED] === 1 ? simulationClock[CLOCK_SLOT.SIMULATION_SECONDS] - lapTiming[LAP_SLOT.START_SECONDS] : 0;
+if (hudOn) HUD.draw(car, lapTiming);
 SND.frame(frozen);
-if (UI.stats) {
-ST[3] += F[7]; ST[4]++;
-if (ST[3] >= 0.5) { ST[0] = ST[4] / ST[3]; ST[1] = 1000 * ST[3] / ST[4]; ST[2] = RENDER.hasTimestamps ? RENDER.stats.gpuMs : -1; ST[3] = 0; ST[4] = 0; HUD.stats(ST); }
+if (userInterface.stats) {
+hudMetrics[HUD_SLOT.SAMPLE_SECONDS] += simulationClock[CLOCK_SLOT.DELTA_SECONDS]; hudMetrics[HUD_SLOT.SAMPLE_FRAMES]++;
+if (hudMetrics[HUD_SLOT.SAMPLE_SECONDS] >= 0.5) { hudMetrics[HUD_SLOT.FPS] = hudMetrics[HUD_SLOT.SAMPLE_FRAMES] / hudMetrics[HUD_SLOT.SAMPLE_SECONDS]; hudMetrics[HUD_SLOT.FRAME_MS] = 1000 * hudMetrics[HUD_SLOT.SAMPLE_SECONDS] / hudMetrics[HUD_SLOT.SAMPLE_FRAMES]; hudMetrics[HUD_SLOT.GPU_MS] = RENDER.hasTimestamps ? RENDER.stats.gpuMs : -1; hudMetrics[HUD_SLOT.SAMPLE_SECONDS] = 0; hudMetrics[HUD_SLOT.SAMPLE_FRAMES] = 0; HUD.stats(hudMetrics); }
 }
-if (ST[5] > 0 && fs.time > ST[5]) { ST[5] = 0; avisoEl.className = ''; }
+if (hudMetrics[HUD_SLOT.NOTICE_HIDE_SECONDS] > 0 && renderFrameState.time > hudMetrics[HUD_SLOT.NOTICE_HIDE_SECONDS]) { hudMetrics[HUD_SLOT.NOTICE_HIDE_SECONDS] = 0; avisoEl.className = ''; }
 }
 const menuEl = $('menu'), avisoEl = $('aviso');
-function say(t) { if (!UI.on) return; avisoEl.textContent = t; avisoEl.className = 'on'; ST[5] = fs.time + 2.4; }
+function say(t) { if (!userInterface.on) return; avisoEl.textContent = t; avisoEl.className = 'on'; hudMetrics[HUD_SLOT.NOTICE_HIDE_SECONDS] = renderFrameState.time + 2.4; }
 function hudVis() {
-if (!UI.on) return;
-hudOn = UI.screen !== 'inicio' && UI.screen !== 'resultado' && !UI.bench && !UI.pose;
-HUD.show(hudOn, UI.stats && UI.screen !== 'inicio' && !UI.bench);
+if (!userInterface.on) return;
+hudOn = userInterface.screen !== 'inicio' && userInterface.screen !== 'resultado' && !userInterface.bench && !userInterface.pose;
+HUD.show(hudOn, userInterface.stats && userInterface.screen !== 'inicio' && !userInterface.bench);
 }
 function setScreen(s) {
-UI.screen = s; paused = s !== 'jogo';
-if (!UI.on) return;
+userInterface.screen = s; paused = s !== 'jogo';
+if (!userInterface.on) return;
 menuEl.className = s; menuEl.hidden = !paused;
 for (const k in keysDown) keysDown[k] = false;
 lookKey = false;
@@ -3932,61 +4041,61 @@ SND.run(!paused);
 hudVis();
 if (paused) $(s === 'inicio' ? 'bS' : 'bC').focus(); else if (document.activeElement && document.activeElement.blur) document.activeElement.blur();
 }
-G.start = () => { if (UI.screen !== 'inicio') return; SND.start(); setScreen('jogo'); camInit = false; fs.cut = true; };
-G.pause = () => { if (UI.screen !== 'jogo') return; if (UI.bench) benchCancel(); setScreen('pausa'); };
-G.resume = () => { if (UI.screen === 'pausa' || UI.screen === 'resultado') setScreen('jogo'); };
-function toGrid() { G.startScripted(); G.mode = 'play'; G.camMode = 0; G.camSchedule = null; G.debugCam = false; }
+gameController.start = () => { if (userInterface.screen !== 'inicio') return; SND.start(); setScreen('jogo'); camInit = false; renderFrameState.cut = true; };
+gameController.pause = () => { if (userInterface.screen !== 'jogo') return; if (userInterface.bench) benchCancel(); setScreen('pausa'); };
+gameController.resume = () => { if (userInterface.screen === 'pausa' || userInterface.screen === 'resultado') setScreen('jogo'); };
+function toGrid() { gameController.startScripted(); gameController.mode = 'play'; gameController.camMode = 0; gameController.camSchedule = null; gameController.debugCam = false; }
 function leavePose() {
-if (!UI.pose) return;
-UI.pose = 0; frozen = false; G.debugCam = false; fs.hud = false; G.camMode = 0; camInit = false; fs.cut = true;
-if (G.mode === 'replay') G.mode = 'play';
+if (!userInterface.pose) return;
+userInterface.pose = 0; frozen = false; gameController.debugCam = false; renderFrameState.hud = false; gameController.camMode = 0; camInit = false; renderFrameState.cut = true;
+if (gameController.mode === 'replay') gameController.mode = 'play';
 hudVis();
 }
 const POSES = [[5.6, -4.4, 1.25, 0, 0, 0.62, 33], [-5.8, 4.2, 2.5, -0.2, 0, 0.9, 34], [0.2, -4.6, 1.4, -0.1, 0, 0.95, 36], null, [-120, 7.5, -3, 60, 1.5, 2, 52], [-10, 38, 70, -170, 0, -190, 55]];
 const POSE_NAMES = ['frente ¾', 'traseira ¾ e escada', 'lateral e interior', 'TV no grampo', 'reta de largada', 'paisagem'];
 const ts6 = new Float64Array(6);
-G.gotoPose = (n) => {
-if (UI.bench || !(n >= 1 && n <= 6)) return;
-UI.watch = false; G.camSchedule = null;
-G.startScripted();
+gameController.gotoPose = (n) => {
+if (userInterface.bench || !(n >= 1 && n <= 6)) return;
+userInterface.watch = false; gameController.camSchedule = null;
+gameController.startScripted();
 if (n === 4) {
-G.camMode = 2; G.debugCam = false; fs.hud = true;
-for (let i = 0; i < 840; i++) G.simFrame(1 / 60);
+gameController.camMode = 2; gameController.debugCam = false; renderFrameState.hud = true;
+for (let i = 0; i < 840; i++) gameController.simFrame(1 / 60);
 frozen = true;
 } else {
-G.mode = 'play'; G.camMode = 0; frozen = false; fs.hud = false;
+gameController.mode = 'play'; gameController.camMode = 0; frozen = false; renderFrameState.hud = false;
 let best = 380, bd = -9; const sd = RENDER.sun.dir;      // trecho aberto, de frente para o sol
 for (let s = 360; s < 430; s += 1) { TRACK.sampleS(s, ts6); const d = ts6[3] * sd[0] + ts6[4] * sd[2]; if (d > bd) { bd = d; best = s; } }
-car.placeOnTrack(best, 1.5); F[3] = car.s; F[1] = 0; copyPrev(); updatePose();
+car.placeOnTrack(best, 1.5); simulationClock[CLOCK_SLOT.PREVIOUS_TRACK_DISTANCE] = car.trackDistance; simulationClock[CLOCK_SLOT.FIXED_STEP_ACCUMULATOR] = 0; copyPrev(); updatePose();
 const q = POSES[n - 1], p = pose;
-if (n <= 3) G.setPose(p.x + p.fx * q[0] - p.fz * q[1], p.y + q[2], p.z + p.fz * q[0] + p.fx * q[1], p.x + p.fx * q[3] - p.fz * q[4], p.y + q[5], p.z + p.fz * q[3] + p.fx * q[4], q[6]);
-else G.setPose(q[0], q[1], q[2], q[3], q[4], q[5], q[6]);
+if (n <= 3) gameController.setPose(p.x + p.fx * q[0] - p.fz * q[1], p.y + q[2], p.z + p.fz * q[0] + p.fx * q[1], p.x + p.fx * q[3] - p.fz * q[4], p.y + q[5], p.z + p.fz * q[3] + p.fx * q[4], q[6]);
+else gameController.setPose(q[0], q[1], q[2], q[3], q[4], q[5], q[6]);
 }
-UI.pose = n; camInit = false; fs.cut = true; lapReset();
+userInterface.pose = n; camInit = false; renderFrameState.cut = true; lapReset();
 hudVis(); say('Pose ' + n + ' — ' + POSE_NAMES[n - 1]);
 };
-G.watchLap = () => {
-if (UI.bench) return;
-leavePose(); G.startScripted(); G.camMode = 0; G.camSchedule = SCHED; G.debugCam = false; UI.watch = true;
+gameController.watchLap = () => {
+if (userInterface.bench) return;
+leavePose(); gameController.startScripted(); gameController.camMode = 0; gameController.camSchedule = SCHED; gameController.debugCam = false; userInterface.watch = true;
 say('Volta roteirizada — acelere ou faça uma curva para assumir');
 };
-G.startBench = () => {
-if (!UI.on || UI.bench || UI.screen === 'inicio' || !G.ready) return;
-leavePose(); UI.watch = false; G.camSchedule = null; G.debugCam = false;
-UI.bench = true; fs.hud = true;
+gameController.startBench = () => {
+if (!userInterface.on || userInterface.bench || userInterface.screen === 'inicio' || !gameController.ready) return;
+leavePose(); userInterface.watch = false; gameController.camSchedule = null; gameController.debugCam = false;
+userInterface.bench = true; renderFrameState.hud = true;
 canvas.style.objectFit = 'contain'; RENDER.resize(2560, 1440);
 setScreen('jogo');
 startPerf();
 say('Benchmark: 60 s — Esc cancela');
 };
-function benchClose() { UI.bench = false; fs.hud = false; canvas.style.objectFit = ''; fit(); toGrid(); }
+function benchClose() { userInterface.bench = false; renderFrameState.hud = false; canvas.style.objectFit = ''; fit(); toGrid(); }
 function benchCancel() { perf.on = false; RENDER.stopTimestampLog(); benchClose(); }
 function benchEnd(r) {
 const st = (a) => { if (!a.length) return null; const v = Float64Array.from(a).sort(); let m = 0; for (let i = 0; i < v.length; i++) m += v[i]; return { media: m / v.length, p99: v[Math.min(v.length - 1, Math.floor(0.99 * v.length))], max: v[v.length - 1] }; };
 const over = (a, lim) => { let n = 0; for (let i = 0; i < a.length; i++) if (a[i] > lim) n++; return n; };
 const fi = r.frameIntervals.slice(5), g = r.gpu.slice(5);
 const res = { quadros: r.frames, segundos: r.seconds, volta: r.lap, largura: RENDER.W, altura: RENDER.H, quadro: st(fi), gpu: st(g), acima16_7: over(fi, 16.75), gpuAcima16_7: g.length ? over(g, 16.7) : null };
-UI.result = res;
+userInterface.result = res;
     const n = (x) => x.toFixed(2).replace('.', ','), row = (t, o) => `<tr><th>${t}</th>` + (o ? `<td>${n(o.media)}</td><td>${n(o.p99)}</td><td>${n(o.max)}</td>` : '<td colspan="3">indisponível neste navegador</td>') + '</tr>';
     $('res').innerHTML = `<h2>Benchmark — volta roteirizada, ${res.largura}×${res.altura}</h2><table><tr><th></th><th>média</th><th>percentil 99</th><th>máximo</th></tr>` +
       row('Tempo de quadro (ms)', res.quadro) + row('Tempo de GPU (ms)', res.gpu) + '</table>' +
@@ -3999,13 +4108,13 @@ let canvas = null, fitT = 0;
 function fit() {
 const W = +(params.get('w') || Math.round(canvas.clientWidth * devicePixelRatio)), H = +(params.get('h') || Math.round(canvas.clientHeight * devicePixelRatio));
 if (W > 0 && H > 0) RENDER.resize(W, H);
-fs.cut = true;
+renderFrameState.cut = true;
 }
 function initUI() {
 HUD.resize();
-$('bS').onclick = G.start; $('bC').onclick = G.resume; $('bB').onclick = G.startBench;
-window.addEventListener('resize', () => { clearTimeout(fitT); fitT = setTimeout(() => { if (!UI.bench) fit(); HUD.resize(); hudVis(); }, 200); });
-document.addEventListener('visibilitychange', () => { if (document.hidden) G.pause(); });
+$('bS').onclick = gameController.start; $('bC').onclick = gameController.resume; $('bB').onclick = gameController.startBench;
+window.addEventListener('resize', () => { clearTimeout(fitT); fitT = setTimeout(() => { if (!userInterface.bench) fit(); HUD.resize(); hudVis(); }, 200); });
+document.addEventListener('visibilitychange', () => { if (document.hidden) gameController.pause(); });
 padCount();
 setScreen('inicio');
 }
@@ -4032,41 +4141,41 @@ const W = +(params.get('w') || Math.round(canvas.clientWidth * devicePixelRatio)
 const H = +(params.get('h') || Math.round(canvas.clientHeight * devicePixelRatio));
 RENDER.resize(W, H);
 if (LAP.meta) car.placeOnTrack(LAP.meta.startS, LAP.meta.startU); else car.placeOnTrack(TRACK.sStart - 8, 2);
-F[3] = car.s; copyPrev();
-if (G.mode === 'replay') G.startScripted();
-if (params.has('cam')) G.camMode = +params.get('cam');
+simulationClock[CLOCK_SLOT.PREVIOUS_TRACK_DISTANCE] = car.trackDistance; copyPrev();
+if (gameController.mode === 'replay') gameController.startScripted();
+if (params.has('cam')) gameController.camMode = +params.get('cam');
 if (params.has('debug')) RENDER.debug = +params.get('debug');
 msg('');
-if (UI.on) initUI();
-G.ready = true;
+if (userInterface.on) initUI();
+gameController.ready = true;
 if (!params.has('manual')) requestAnimationFrame(loop);
 if (params.has('perf')) startPerf();
 } catch (e) {
 console.error(e);
 msg('Erro: ' + e.message);
-G.error = String(e.stack || e);
+gameController.error = String(e.stack || e);
 }
 }
-G.setPose = (x, y, z, tx, ty, tz, fovDeg) => {
-G.debugCam = true;
-const c = fs.cam; c.x = x; c.y = y; c.z = z; c.tx = tx; c.ty = ty; c.tz = tz; c.fovy = fovDeg * PI / 180;
+gameController.setPose = (x, y, z, tx, ty, tz, fovDeg) => {
+gameController.debugCam = true;
+const c = renderFrameState.cam; c.x = x; c.y = y; c.z = z; c.tx = tx; c.ty = ty; c.tz = tz; c.fovy = fovDeg * PI / 180;
 };
-G.step = (dt) => { F[7] = dt; tick(); };
-G.camSchedule = null;
-G.applySchedule = () => {
-if (!G.camSchedule) return;
-let c = 0; const cs = G.camSchedule; for (let i = 0; i < cs.length; i++) if (F[0] >= cs[i][0]) c = cs[i][1];
-if (c !== G.camMode) { G.camMode = c; camInit = false; fs.cut = true; }
+gameController.step = (dt) => { simulationClock[CLOCK_SLOT.DELTA_SECONDS] = dt; tick(); };
+gameController.camSchedule = null;
+gameController.applySchedule = () => {
+if (!gameController.camSchedule) return;
+let c = 0; const cs = gameController.camSchedule; for (let i = 0; i < cs.length; i++) if (simulationClock[CLOCK_SLOT.SIMULATION_SECONDS] >= cs[i][0]) c = cs[i][1];
+if (c !== gameController.camMode) { gameController.camMode = c; camInit = false; renderFrameState.cut = true; }
 };
-G.renderN = async (n, dt) => { for (let i = 0; i < n; i++) { F[7] = dt; tick(); } await RENDER.device.queue.onSubmittedWorkDone(); };
-G.state = () => ({ speed: car.u, kmh: Math.abs(car.u) * 3.6, steer: car.steer, steerIn: car.steerIn, brake: car.brk, hb: car.hb, x: car.x, z: car.z, psi: car.psi, s: car.s, u: car.u_lat,
-cam: G.camMode, camName: CAM_NAMES[G.camMode], camPos: [fs.cam.x, fs.cam.y, fs.cam.z], offWheels: car.offTrackWheels, gear: car.gear, reverse: car.reverse, simTime: F[0], lap: G.lastLap, yawRate: car.r, roll: car.roll, pitch: car.pitch, mode: G.mode,
-thr: car.thr, rpm: car.rpm, rpmSom: SND.M[0], steerRate: input.stick ? 'analógico' : 'teclas', pad: padN, lookBack: !!G.lookBack, camTarget: [fs.cam.tx, fs.cam.ty, fs.cam.tz],
-screen: UI.screen, paused, frozen, pose: UI.pose, bench: UI.bench, watch: UI.watch, stats: UI.stats, muted: SND.muted, audio: SND.ctx ? SND.ctx.state : 'nenhum', hud: hudOn, shaderHud: fs.hud,
-lapNow: LT[0], lapLast: LT[1], lapBest: LT[2], laps: LT[7], frame: simFrame });
+gameController.renderN = async (n, dt) => { for (let i = 0; i < n; i++) { simulationClock[CLOCK_SLOT.DELTA_SECONDS] = dt; tick(); } await RENDER.device.queue.onSubmittedWorkDone(); };
+gameController.state = () => ({ speed: car.forwardVelocity, kmh: Math.abs(car.forwardVelocity) * 3.6, steer: car.steeringAngle, steerIn: car.steeringInput, brake: car.brake, hb: car.handbrake, x: car.x, z: car.z, psi: car.headingRadians, s: car.trackDistance, u: car.trackLateralOffset,
+cam: gameController.camMode, camName: CAM_NAMES[gameController.camMode], camPos: [renderFrameState.cam.x, renderFrameState.cam.y, renderFrameState.cam.z], offWheels: car.offTrackWheelCount, gear: car.gear, reverse: car.reverse, simTime: simulationClock[CLOCK_SLOT.SIMULATION_SECONDS], lap: gameController.lastLap, yawRate: car.yawRate, roll: car.roll, pitch: car.pitch, mode: gameController.mode,
+thr: car.throttle, rpm: car.rpm, rpmSom: SND.M[0], steerRate: input.stick ? 'analógico' : 'teclas', pad: padN, lookBack: !!gameController.lookBack, camTarget: [renderFrameState.cam.tx, renderFrameState.cam.ty, renderFrameState.cam.tz],
+screen: userInterface.screen, paused, frozen, pose: userInterface.pose, bench: userInterface.bench, watch: userInterface.watch, stats: userInterface.stats, muted: SND.muted, audio: SND.ctx ? SND.ctx.state : 'nenhum', hud: hudOn, shaderHud: renderFrameState.hud,
+lapNow: lapTiming[LAP_SLOT.CURRENT_SECONDS], lapLast: lapTiming[LAP_SLOT.LAST_SECONDS], lapBest: lapTiming[LAP_SLOT.BEST_SECONDS], laps: lapTiming[LAP_SLOT.COMPLETED_LAPS], frame: simFrame });
 function loop(t) {
-F[7] = F[5] ? Math.min((t - F[5]) / 1000, 0.1) : 1 / 60;
-F[5] = t;
+simulationClock[CLOCK_SLOT.DELTA_SECONDS] = simulationClock[CLOCK_SLOT.PREVIOUS_RAF_MS] ? Math.min((t - simulationClock[CLOCK_SLOT.PREVIOUS_RAF_MS]) / 1000, 0.1) : 1 / 60;
+simulationClock[CLOCK_SLOT.PREVIOUS_RAF_MS] = t;
 tick();
 if (perf.on) perfTick(t);
 requestAnimationFrame(loop);
@@ -4074,37 +4183,37 @@ requestAnimationFrame(loop);
 const perf = { on: false, t0: 0, frames: 0, cpu: null };
 function startPerf() {
 FX.warm(car);
-fs.allShadows = true; fs.allCubeFaces = true;
-F[7] = 1 / 60;
+renderFrameState.allShadows = true; renderFrameState.allCubeFaces = true;
+simulationClock[CLOCK_SLOT.DELTA_SECONDS] = 1 / 60;
 for (let i = 0; i < 12; i++) frame();
-fs.allShadows = false; fs.allCubeFaces = false;
-for (let i = 0; i < 4; i++) { G.cycleCamera(); frame(); frame(); }
-G.camMode = 0;
-G.startScripted();
+renderFrameState.allShadows = false; renderFrameState.allCubeFaces = false;
+for (let i = 0; i < 4; i++) { gameController.cycleCamera(); frame(); frame(); }
+gameController.camMode = 0;
+gameController.startScripted();
 for (let i = 0; i < 60; i++) frame();
-G.startScripted();
+gameController.startScripted();
 perf.on = true; perf.t0 = 0; perf.frames = 0;
 perf.cpu = new Float32Array(20000);
 RENDER.startTimestampLog(20000);
-G.startScripted();
+gameController.startScripted();
 }
 function perfTick(t) {
 if (!perf.t0) perf.t0 = t;
-if (F[6]) perf.cpu[perf.frames] = t - F[6];
-F[6] = t;
+if (simulationClock[CLOCK_SLOT.PREVIOUS_PERF_MS]) perf.cpu[perf.frames] = t - simulationClock[CLOCK_SLOT.PREVIOUS_PERF_MS];
+simulationClock[CLOCK_SLOT.PREVIOUS_PERF_MS] = t;
 perf.frames++;
 if (t - perf.t0 >= 60000) {
 perf.on = false;
 RENDER.stopTimestampLog().then((gpu) => {
-window.__perf = { gpu: Array.from(gpu || []), frameIntervals: Array.from(perf.cpu.subarray(1, perf.frames)), frames: perf.frames, seconds: (t - perf.t0) / 1000, lap: G.lastLap };
-if (UI.bench) benchEnd(window.__perf);
+window.__perf = { gpu: Array.from(gpu || []), frameIntervals: Array.from(perf.cpu.subarray(1, perf.frames)), frames: perf.frames, seconds: (t - perf.t0) / 1000, lap: gameController.lastLap };
+if (userInterface.bench) benchEnd(window.__perf);
 });
 }
 }
-window.__game = G;
+window.__game = gameController;
 window.__dbg = { VEG, RENDER, TRACK, TERRAIN, CARGFX, WORLD, AI, LAP, SND, HUD };
 main();
-return G;
+return gameController;
 })();
 
 </script>
