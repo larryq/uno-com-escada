@@ -48,6 +48,13 @@ const bundle = `'use strict';\nconst SHADERS = ${JSON.stringify(sh)};\nconst LAP
 new vm.Script(bundle);   // confere a sintaxe do pacote antes de gravar
 const tpl = fs.readFileSync(path.join(here, 'index.template.html'), 'utf8');
 const out = tpl.replace('/*__BUNDLE__*/', () => bundle);
-const dst = path.join(here, '..', 'index.html');
-fs.writeFileSync(dst, out);
-console.log('index.html', (out.length / 1024).toFixed(1), 'KB');
+// --check validates the assembled JavaScript without touching the generated game.
+if (process.argv.includes('--check')) {
+  console.log('Opus JavaScript bundle syntax: OK (' + (out.length / 1024).toFixed(1) + ' KB)');
+} else {
+  const outputArg = process.argv.indexOf('--out');
+  if (outputArg >= 0 && !process.argv[outputArg + 1]) throw new Error('--out requires a filename');
+  const dst = outputArg >= 0 ? path.resolve(process.argv[outputArg + 1]) : path.join(here, '..', 'index.html');
+  fs.writeFileSync(dst, out);
+  console.log(dst, (out.length / 1024).toFixed(1), 'KB');
+}

@@ -1,0 +1,12 @@
+{
+  "name": "uno-com-escada-readable",
+  "private": true,
+  "description": "Offline procedural Fiat Uno racing game, with a readable Opus implementation",
+  "scripts": {
+    "test": "npm run test:physics && npm run check:opus",
+    "test:physics": "node opus/source/tests/physics-regression.mjs",
+    "check:opus": "node opus/source/build.mjs --check",
+    "build:opus": "node opus/source/build.mjs",
+    "build:fable": "node fable/source/build.mjs"
+  }
+}

@@ -90,13 +90,13 @@ const FX = (() => {
   }
   // chamado a cada passo de física
   F.simStep = (car, dt) => {
-    const c = Math.cos(car.psi), s = Math.sin(car.psi);
-    const vxw = c * car.u - s * car.v, vzw = s * car.u + c * car.v;
+    const c = Math.cos(car.headingRadians), s = Math.sin(car.headingRadians);
+    const vxw = c * car.forwardVelocity - s * car.lateralVelocity, vzw = s * car.forwardVelocity + c * car.lateralVelocity;
     for (let k = 0; k < 4; k++) {
       const sl = car.slip[k];
-      const surf = car.surf[k];
-      const x = car.wx[k], z = car.wz[k], y = car.wy[k] + 0.012;
-      const marking = sl > 2.2 && surf <= 1 && Math.abs(car.u) > 1.0 && car.wetW[k] < 0.3;
+      const surf = car.wheelSurfaceTypes[k];
+      const x = car.wheelWorldX[k], z = car.wheelWorldZ[k], y = car.wheelWorldY[k] + 0.012;
+      const marking = sl > 2.2 && surf <= 1 && Math.abs(car.forwardVelocity) > 1.0 && car.wheelWetness[k] < 0.3;
       if (marking) {
         const inten = clamp((sl - 2.2) / 5, 0.15, 1);
         if (!lastOn[k]) { last[k * 3] = x; last[k * 3 + 1] = y; last[k * 3 + 2] = z; lastOn[k] = 1; }
@@ -106,7 +106,7 @@ const FX = (() => {
         }
       } else lastOn[k] = 0;
       // fumaça (pneu no asfalto) e poeira (grama/brita)
-      const smokeAmt = (Math.abs(car.u) < 7 || (car.brk < 0.7 && car.hb < 0.3) ? 0 : 1) * (surf <= 1 ? clamp((sl - 9.0) / 8, 0, 1) : clamp((Math.abs(car.u) - 3) / 15, 0, 1) * 0.6) * (1 - clamp(car.wetW[k] * 3, 0, 1));
+      const smokeAmt = (Math.abs(car.forwardVelocity) < 7 || (car.brake < 0.7 && car.handbrake < 0.3) ? 0 : 1) * (surf <= 1 ? clamp((sl - 9.0) / 8, 0, 1) : clamp((Math.abs(car.forwardVelocity) - 3) / 15, 0, 1) * 0.6) * (1 - clamp(car.wheelWetness[k] * 3, 0, 1));
       if (smokeAmt > 0) {
         emitAcc[k] += smokeAmt * 75 * dt;
         while (emitAcc[k] >= 1) { emitAcc[k] -= 1; emit(x, y, z, vxw, vzw, smokeAmt); }

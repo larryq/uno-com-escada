@@ -123,3 +123,7 @@ Cada comando reescreve o `index.html` da versão.
 ## Licença
 
 [PolyForm Noncommercial 1.0.0](LICENSE.md): livre para usar, estudar, mudar e compartilhar sem fim comercial.
+
+## Developer guide (English)
+
+On the `analysis/opus-readable` branch, the Opus version has more descriptive physics/game-state names and a dependency-free physics regression suite. Start with [Opus architecture](opus/ARCHITECTURE.md), then read [how the car physics works](opus/PHYSICS.md). Run `npm test` to validate the physics and bundle syntax; run `node opus/source/build.mjs` to regenerate the playable HTML. The Fable version is unchanged.

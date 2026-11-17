@@ -18,38 +18,38 @@ const SND = (() => {
     const P = PHYS;
     // giro: o da física (preso às rodas) mais a patinagem de embreagem na saída em 1ª/ré
     let tg = car.rpm;
-    if (car.gear === 1 || car.reverse) { const sl = P.idle + car.thr * 1900; if (sl > tg) tg = sl; }
+    if (car.gear === 1 || car.reverse) { const sl = P.idle + car.throttle * 1900; if (sl > tg) tg = sl; }
     if (tg > 6700) tg = 6700;
     M[0] += (tg - M[0]) * (tg > M[0] ? 0.15 : 0.11);
     // carga: acelerador, corte na troca de marcha e corte de giro
-    let ld = car.thr * (car.shiftT > 0.12 ? 0.1 : 1);
-    if (car.rpm >= P.redline && ((car.time * 21) % 1) < 0.45) ld *= 0.2;
+    let ld = car.throttle * (car.gearShiftCooldown > 0.12 ? 0.1 : 1);
+    if (car.rpm >= P.redline && ((car.elapsedSeconds * 21) % 1) < 0.45) ld *= 0.2;
     const il = 0.28 * (1 - clamp((M[0] - 1000) / 900, 0, 1));
     if (ld < il) ld = il;
     M[1] += (ld - M[1]) * 0.25;
     // pneus: só no asfalto/zebra, além do pico de aderência, na proporção da velocidade de escorregamento
     let aF = 0, aR = 0, pF = 0, pR = 0, off = 0, kerb = 0, sv = 0;
     for (let k = 0; k < 4; k++) {
-      const sf = car.surf[k];
+      const sf = car.wheelSurfaceTypes[k];
       if (sf > 1) { off += 0.25; continue; }
       if (sf === 1) kerb += 0.5;
       const sl = car.slip[k];
-      const q = clamp((car.sn[k] - 0.9) / 0.9, 0, 1) * clamp((sl - 0.8) / 2.5, 0, 1) * (0.25 + 0.75 * clamp(sl / 26, 0, 1)) * clamp(car.load[k] / 2100, 0.25, 1.2) * (1 - car.wetW[k] * 0.6);
+      const q = clamp((car.normalizedTireSlip[k] - 0.9) / 0.9, 0, 1) * clamp((sl - 0.8) / 2.5, 0, 1) * (0.25 + 0.75 * clamp(sl / 26, 0, 1)) * clamp(car.wheelNormalLoads[k] / 2100, 0.25, 1.2) * (1 - car.wheelWetness[k] * 0.6);
       const sd = k & 1 ? 1 : -1;
       if (k < 2) { if (q > aF) aF = q; pF += sd * q; } else { if (q > aR) aR = q; pR += sd * q; }
       if (q > 0 && sl > sv) sv = sl;
     }
     M[2] = aF > 1 ? 1 : aF; M[3] = aR > 1 ? 1 : aR; M[4] = clamp(pF * 0.6, -0.6, 0.6); M[5] = clamp(pR * 0.6, -0.6, 0.6);
-    M[6] = Math.hypot(car.u, car.v); M[7] = off; M[8] = kerb > 1 ? 1 : kerb; M[14] = sv;
+    M[6] = Math.hypot(car.forwardVelocity, car.lateralVelocity); M[7] = off; M[8] = kerb > 1 ? 1 : kerb; M[14] = sv;
     // público: distância ao lance da arquibancada (x de -150 a -15, z ≈ 20) e lado em relação ao carro
     const nx = clamp(car.x, -150, -15), dx = nx - car.x, dz = 20 - car.z, d2 = dx * dx + dz * dz;
     M[9] = 1 / (1 + d2 / 1100);
-    M[10] = (-Math.sin(car.psi) * dx + Math.cos(car.psi) * dz) / (Math.sqrt(d2) + 1) * 0.7;
+    M[10] = (-Math.sin(car.headingRadians) * dx + Math.cos(car.headingRadians) * dz) / (Math.sqrt(d2) + 1) * 0.7;
     const g = car.reverse ? -1 : car.gear;
     // envelopes dos eventos (troca de marcha, batida) no passo da simulação: nada é agendado durante o jogo
     M[12] *= 0.72; M[13] *= 0.9;
     if (g !== M[11]) { M[11] = g; M[12] = 1; }
-    const wh = car.wallHit > 14 ? 1.6 : car.wallHit / 9;
+    const wh = car.wallImpactSpeed > 14 ? 1.6 : car.wallImpactSpeed / 9;
     if (wh > M[13]) M[13] = wh;
   };
 
@@ -286,8 +286,8 @@ const SND = (() => {
     const reg = {}; for (const k of ['rpm', 'rpmSom', 'marcha', 'carga', 'acel', 'kmh', 'pneuD', 'pneuT', 'snD', 'snT', 'escD', 'escT', 'publico', 'x', 'z']) reg[k] = new Float32Array(n);
     for (let i = 0; i < n; i++) {
       G.simFrame(1 / 60);
-      reg.rpm[i] = car.rpm; reg.rpmSom[i] = M[0]; reg.marcha[i] = car.gear; reg.carga[i] = M[1]; reg.acel[i] = car.thr; reg.kmh[i] = car.u * 3.6;
-      reg.pneuD[i] = M[2]; reg.pneuT[i] = M[3]; reg.snD[i] = Math.max(car.sn[0], car.sn[1]); reg.snT[i] = Math.max(car.sn[2], car.sn[3]);
+      reg.rpm[i] = car.rpm; reg.rpmSom[i] = M[0]; reg.marcha[i] = car.gear; reg.carga[i] = M[1]; reg.acel[i] = car.throttle; reg.kmh[i] = car.forwardVelocity * 3.6;
+      reg.pneuD[i] = M[2]; reg.pneuT[i] = M[3]; reg.snD[i] = Math.max(car.normalizedTireSlip[0], car.normalizedTireSlip[1]); reg.snT[i] = Math.max(car.normalizedTireSlip[2], car.normalizedTireSlip[3]);
       reg.escD[i] = Math.max(car.slip[0], car.slip[1]); reg.escT[i] = Math.max(car.slip[2], car.slip[3]); reg.publico[i] = M[9]; reg.x[i] = car.x; reg.z[i] = car.z;
       apply(V, i / 60, false);
     }

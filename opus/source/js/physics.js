@@ -1,24 +1,30 @@
-// ---------------------------------------------------------------------------
-// physics.js — dinâmica do Uno (tração dianteira), determinística, sem alocação
-// Local: a = frente, b = direita. Ângulo ψ: frente = (cos ψ, sin ψ) em (x, z)
-// ---------------------------------------------------------------------------
+// CPU-only deterministic, front-wheel-drive physics (independent of WebGPU).
+// World Y is up; motion lies in X/Z; positive heading turns +X toward +Z.
+// Wheel order: front-left, front-right, rear-left, rear-right.
 'use strict';
 
+/**
+ * Calibrated constants. SI units unless explicitly noted.
+ * DT: seconds per simulation step; SUB: wheel-integration substeps.
+ * Iz: yaw inertia (kg*m²); cgA/cgB: distance from center of mass to axles.
+ * cgH: center-of-mass height (m); R: wheel radius (m); Iw: wheel inertia.
+ * Numerical values are deliberately unchanged by this readability pass.
+ */
 const PHYS = {
   DT: 1 / 120, SUB: 4,
   mass: 845, Iz: 1150, g: 9.81,
-  cgA: 0.944,                 // CG -> eixo dianteiro
-  cgB: 1.416,                 // CG -> eixo traseiro
+  cgA: 0.944,                 // center of mass to front axle
+  cgB: 1.416,                 // center of mass to rear axle
   cgH: 0.50,
   R: 0.292, Iw: 0.9,
   gears: [3.909, 2.157, 1.480, 1.121, 0.902], final: 4.071, revGear: 3.818,
   idle: 900, redline: 6300,
   brakeF: 1000, brakeR: 360, handbrake: 1700,
-  maxSteer: 0.62,             // rad nas rodas (batente)
+  maxSteer: 0.62,             // maximum wheel steering angle (radians)
   dragK: 0.40, roll: 0.013,
 };
 
-// torque do motor (Nm) por rpm — Mille preparado (~70 cv)
+// Approximate tuned-engine torque (N·m), keyed by RPM.
 function engineTorque(rpm) {
   const r = rpm / 1000;
   if (r < 1) return 70;
@@ -28,50 +34,99 @@ function engineTorque(rpm) {
   return 45;
 }
 
-class Car {
+/**
+ * One vehicle's authoritative CPU-side state. The rest of the game reads it.
+ * forwardVelocity, lateralVelocity: speeds in the car's own frame (m/s).
+ * headingRadians, yawRate: orientation (rad) and rotation speed (rad/s).
+ * trackDistance, trackLateralOffset: position relative to course centerline (m).
+ */
+class VehiclePhysics {
   constructor() {
-    // estado
-    this.x = 0; this.z = 0; this.y = 0; this.psi = 0;
-    this.u = 0; this.v = 0; this.r = 0;       // velocidades locais e guinada
-    this.w = new Float64Array(4);             // vel. angular das rodas (DE, DD, TE, TD)
-    this.spin = new Float64Array(4);
-    this.steer = 0; this.thr = 0; this.brk = 0; this.hb = 0; this.steerIn = 0;
-    this.gear = 1; this.rpm = 900; this.reverse = false; this.shiftT = 0;
-    this.ax = 0; this.ay = 0;
-    this.roll = 0; this.rollV = 0; this.pitch = 0; this.pitchV = 0; this.heave = 0; this.heaveV = 0;
-    this.pitchG = 0; this.rollG = 0;
-    this.hint = -1; this.s = 0; this.u_lat = 0;
-    this.slip = new Float64Array(4);          // velocidade de escorregamento (m/s)
-    this.sn = new Float64Array(4);            // escorregamento normalizado (1 = pico de aderência) — só leitura (som)
-    this.load = new Float64Array(4);
-    this.surf = new Uint8Array(4);            // 0 asfalto, 1 zebra, 2 grama, 3 brita
-    this.wetW = new Float64Array(4);
-    this.wx = new Float64Array(4); this.wz = new Float64Array(4); this.wy = new Float64Array(4);
-    this.onAsphalt = true; this.offTrackWheels = 0;
-    this.wallHit = 0; this.time = 0;
-    this._p = new Float64Array(3); this._ts = new Float64Array(6);
-    this.fx = new Float64Array(4); this.fy = new Float64Array(4);
+    // Vehicle state: movement, powertrain, contact patches, and visual suspension.
+    this.x = 0;
+    this.z = 0;
+    this.y = 0;
+    this.headingRadians = 0;
+    this.forwardVelocity = 0;
+    this.lateralVelocity = 0;
+    this.yawRate = 0;       // car-local forward/right speed and yaw rate
+    this.wheelAngularVelocities = new Float64Array(4);             // wheel angular speed (front-left, front-right, rear-left, rear-right)
+    this.wheelSpinAngles = new Float64Array(4);
+    this.steeringAngle = 0;
+    this.throttle = 0;
+    this.brake = 0;
+    this.handbrake = 0;
+    this.steeringInput = 0;
+    this.gear = 1;
+    this.rpm = 900;
+    this.reverse = false;
+    this.gearShiftCooldown = 0;
+    this.forwardAcceleration = 0;
+    this.lateralAcceleration = 0;
+    this.roll = 0;
+    this.rollVelocity = 0;
+    this.pitch = 0;
+    this.pitchVelocity = 0;
+    this.heave = 0;
+    this.heaveVelocity = 0;
+    this.roadPitch = 0;
+    this.roadRoll = 0;
+    this.trackSegmentHint = -1;
+    this.trackDistance = 0;
+    this.trackLateralOffset = 0;
+    this.slip = new Float64Array(4);          // slip speed (m/s)
+    this.normalizedTireSlip = new Float64Array(4);            // dimensionless tire slip (1 ≈ peak grip); audio reads this
+    this.wheelNormalLoads = new Float64Array(4);
+    this.wheelSurfaceTypes = new Uint8Array(4);            // 0 asphalt, 1 curb, 2 grass, 3 gravel
+    this.wheelWetness = new Float64Array(4);
+    this.wheelWorldX = new Float64Array(4);
+    this.wheelWorldZ = new Float64Array(4);
+    this.wheelWorldY = new Float64Array(4);
+    this.onAsphalt = true;
+    this.offTrackWheelCount = 0;
+    this.wallImpactSpeed = 0;
+    this.elapsedSeconds = 0;
+    this._trackProjection = new Float64Array(3);
+    this._trackSample = new Float64Array(6);
+    this.wheelForwardForces = new Float64Array(4);
+    this.wheelLateralForces = new Float64Array(4);
   }
-  speed() { return Math.hypot(this.u, this.v); }
+  speed() { return Math.hypot(this.forwardVelocity, this.lateralVelocity); }
+  /** Reset the car at longitudinal track distance s and signed lateral offset uOff (meters). */
   placeOnTrack(s, uOff) {
-    const T = TRACK, o = this._p;
-    const ts = this._ts;
+    const T = TRACK, o = this._trackProjection;
+    const ts = this._trackSample;
     T.sampleS(s, ts);
-    this.psi = Math.atan2(ts[4], ts[3]);
+    this.headingRadians = Math.atan2(ts[4], ts[3]);
     const rx = -ts[4], rz = ts[3];
-    this.x = ts[0] + rx * uOff; this.z = ts[2] + rz * uOff;
-    this.u = this.v = this.r = 0; this.w.fill(0); this.spin.fill(0); this.slip.fill(0); this.sn.fill(0);
-    this.steer = 0; this.steerIn = 0; this.thr = this.brk = this.hb = 0; this.gear = 1; this.reverse = false;
-    this.rpm = PHYS.idle; this.shiftT = 0; this.ax = 0; this.ay = 0;
-    this.roll = this.rollV = this.pitch = this.pitchV = this.heave = this.heaveV = 0;
-    this.fx.fill(0); this.fy.fill(0); this.wallHit = 0; this.time = 0;
-    this.hint = -1;
+    this.x = ts[0] + rx * uOff;
+    this.z = ts[2] + rz * uOff;
+    this.forwardVelocity = this.lateralVelocity = this.yawRate = 0;
+    this.wheelAngularVelocities.fill(0);
+    this.wheelSpinAngles.fill(0);
+    this.slip.fill(0);
+    this.normalizedTireSlip.fill(0);
+    this.steeringAngle = 0;
+    this.steeringInput = 0;
+    this.throttle = this.brake = this.handbrake = 0;
+    this.gear = 1;
+    this.reverse = false;
+    this.rpm = PHYS.idle;
+    this.gearShiftCooldown = 0;
+    this.forwardAcceleration = 0;
+    this.lateralAcceleration = 0;
+    this.roll = this.rollVelocity = this.pitch = this.pitchVelocity = this.heave = this.heaveVelocity = 0;
+    this.wheelForwardForces.fill(0);
+    this.wheelLateralForces.fill(0);
+    this.wallImpactSpeed = 0;
+    this.elapsedSeconds = 0;
+    this.trackSegmentHint = -1;
     this.updateGround();
   }
-  // altura e tipo de superfície num ponto do mundo
+  // Return ground height and record surface type/wetness for wheel k.
   groundAt(x, z, k) {
-    const T = TRACK, o = this._p;
-    T.project(x, z, this.hint, o);
+    const T = TRACK, o = this._trackProjection;
+    T.project(x, z, this.trackSegmentHint, o);
     const s = o[0], u = o[1];
     const hw = T.lerpArr(T.hw, s);
     const au = Math.abs(u);
@@ -85,205 +140,255 @@ class Car {
       const g0 = hw + kw + 1.6;
       surf = (gw > 1.5 && au > g0 && au < g0 + gw) ? 3 : 2;
     }
-    if (k >= 0) { this.surf[k] = surf; this.wetW[k] = surf === 0 ? T.lerpArr(T.wet, s) : 0; }
+    if (k >= 0) { this.wheelSurfaceTypes[k] = surf;
+    this.wheelWetness[k] = surf === 0 ? T.lerpArr(T.wet, s) : 0; }
     return y;
   }
+  /** Locate the car and all wheels on the track/terrain; update ground alignment. */
   updateGround() {
-    const c = Math.cos(this.psi), sn = Math.sin(this.psi);
-    const T = TRACK, o = this._p;
-    T.project(this.x, this.z, this.hint, o);
-    this.hint = o[2]; this.s = o[0]; this.u_lat = o[1];
+    const c = Math.cos(this.headingRadians), sn = Math.sin(this.headingRadians);
+    const T = TRACK, o = this._trackProjection;
+    T.project(this.x, this.z, this.trackSegmentHint, o);
+    this.trackSegmentHint = o[2];
+    this.trackDistance = o[0];
+    this.trackLateralOffset = o[1];
     let off = 0;
     for (let k = 0; k < 4; k++) {
       const a = k < 2 ? 1.18 : -1.18, b = (k & 1 ? 1 : -1) * (k < 2 ? 0.67 : 0.655);
       const x = this.x + c * a - sn * b, z = this.z + sn * a + c * b;
-      this.wx[k] = x; this.wz[k] = z;
-      this.wy[k] = this.groundAt(x, z, k);
-      T.project(x, z, this.hint, o);
+      this.wheelWorldX[k] = x;
+      this.wheelWorldZ[k] = z;
+      this.wheelWorldY[k] = this.groundAt(x, z, k);
+      T.project(x, z, this.trackSegmentHint, o);
       if (Math.abs(o[1]) > T.lerpArr(T.hw, o[0]) + 0.3) off++;
     }
-    this.offTrackWheels = off;
+    this.offTrackWheelCount = off;
     this.onAsphalt = off === 0;
-    // plano pelas 4 rodas
-    const yf = (this.wy[0] + this.wy[1]) * 0.5, yr = (this.wy[2] + this.wy[3]) * 0.5;
-    const yl = (this.wy[0] + this.wy[2]) * 0.5, yrr = (this.wy[1] + this.wy[3]) * 0.5;
-    this.pitchG = Math.atan2(yf - yr, 2.36);
-    this.rollG = Math.atan2(yl - yrr, 1.33);
+    // Fit ground pitch/roll from the four tire contact heights.
+    const yf = (this.wheelWorldY[0] + this.wheelWorldY[1]) * 0.5, yr = (this.wheelWorldY[2] + this.wheelWorldY[3]) * 0.5;
+    const yl = (this.wheelWorldY[0] + this.wheelWorldY[2]) * 0.5, yrr = (this.wheelWorldY[1] + this.wheelWorldY[3]) * 0.5;
+    this.roadPitch = Math.atan2(yf - yr, 2.36);
+    this.roadRoll = Math.atan2(yl - yrr, 1.33);
     this.y = (yf + yr) * 0.5;
   }
-  // entrada digital: up, down, left, right, hand (booleanos)
-  // entrada analógica (jogo): inp.analog + inp.a = [direção -1..1, acelerador 0..1, freio/ré 0..1]; inp.stick = direção vem do analógico
-  // (com valores 0/1 e stick falso, o caminho analógico dá exatamente os mesmos números do digital)
-  step(inp, dt) {
-    const P = PHYS;
-    const spd = this.u;
-    const an = inp.analog === true, A = inp.a;
-    // ---- filtros de entrada
-    const steerTarget = an ? A[0] : (inp.right ? 1 : 0) - (inp.left ? 1 : 0);
-    const rate = an && inp.stick ? 9.0 : steerTarget === 0 ? 4.0 : (Math.sign(steerTarget) !== Math.sign(this.steerIn) && this.steerIn !== 0 ? 6.0 : 2.6);
-    this.steerIn += clamp(steerTarget - this.steerIn, -rate * dt, rate * dt);
-    // trava reduzida com a velocidade (ajuda no teclado)
-    const lock = P.maxSteer / (1 + Math.abs(spd) * 0.045);
-    this.steer = this.steerIn * lock;
-    let wantThr = 0, wantBrk = 0;
-    const aU = an ? A[1] : (inp.up ? 1 : 0), aD = an ? A[2] : (inp.down ? 1 : 0);
-    if (aU > 0) { if (this.reverse && spd < -0.5) wantBrk = aU; else { wantThr = aU; if (Math.abs(spd) < 0.6) this.reverse = false; } }
-    if (aD > 0) {
-      if (!this.reverse && spd > 0.6) wantBrk = aD;
-      else { this.reverse = true; wantThr = aD; }
+  // Controls can be digital booleans or analog steering/accelerator/brake.
+  // With analog=true, controls.a = [steer -1..1, throttle 0..1, brake/reverse 0..1].
+  // controls.stick selects the faster gamepad steering response.
+  /**
+   * Advance one deterministic physics step:
+   * user input -> drivetrain -> wheel loads -> tire forces -> body motion.
+   * The renderer has no influence on these calculations.
+   * @param {object} controls Current keyboard/gamepad command state.
+   * @param {number} deltaTimeSeconds Usually PHYS.DT (1/120 s).
+   */
+  step(controls, deltaTimeSeconds) {
+    this.updateDriverControls(controls, deltaTimeSeconds);
+    const driveTorqueNm = this.updatePowertrain(deltaTimeSeconds);
+    this.updateWheelLoads();
+    this.integrateVehicleDynamics(deltaTimeSeconds, driveTorqueNm);
+  }
+
+  /** Smooth steering and pedals and determine forward/reverse selection. */
+  updateDriverControls(controls, deltaTimeSeconds) {
+    const parameters = PHYS;
+    const forwardSpeed = this.forwardVelocity;
+    const usesAnalogInput = controls.analog === true;
+    const analogControls = controls.a;
+    const steeringTarget = usesAnalogInput ? analogControls[0] : (controls.right ? 1 : 0) - (controls.left ? 1 : 0);
+    const steeringResponseRate = usesAnalogInput && controls.stick ? 9.0 : steeringTarget === 0 ? 4.0 : (Math.sign(steeringTarget) !== Math.sign(this.steeringInput) && this.steeringInput !== 0 ? 6.0 : 2.6);
+    this.steeringInput += clamp(steeringTarget - this.steeringInput, -steeringResponseRate * deltaTimeSeconds, steeringResponseRate * deltaTimeSeconds);
+    // Reduce steering lock as speed increases, especially useful for keyboard input.
+    const maxSteeringAtSpeed = parameters.maxSteer / (1 + Math.abs(forwardSpeed) * 0.045);
+    this.steeringAngle = this.steeringInput * maxSteeringAtSpeed;
+    let requestedThrottle = 0, requestedBrake = 0;
+    const acceleratorControl = usesAnalogInput ? analogControls[1] : (controls.up ? 1 : 0), brakeControl = usesAnalogInput ? analogControls[2] : (controls.down ? 1 : 0);
+    if (acceleratorControl > 0) { if (this.reverse && forwardSpeed < -0.5) requestedBrake = acceleratorControl; else { requestedThrottle = acceleratorControl; if (Math.abs(forwardSpeed) < 0.6) this.reverse = false; } }
+    if (brakeControl > 0) {
+      if (!this.reverse && forwardSpeed > 0.6) requestedBrake = brakeControl;
+      else { this.reverse = true; requestedThrottle = brakeControl; }
     }
-    if (!(aU > 0) && !(aD > 0) && this.reverse && spd > 0.2) this.reverse = false;
-    this.thr += clamp(wantThr - this.thr, -8 * dt, 6 * dt);
-    this.brk += clamp(wantBrk - this.brk, -10 * dt, 7 * dt);
-    this.hb += clamp((inp.hand ? 1 : 0) - this.hb, -10 * dt, 12 * dt);
-    // ---- câmbio automático
-    // rpm pela roda motriz, mas trocas pela velocidade do carro (roda travada não reduz marcha)
-    const wheelRpmF = Math.abs((this.w[0] + this.w[1]) * 0.5) * 60 / TAU;
-    const carRpmW = Math.abs(this.u) / P.R * 60 / TAU;
-    this.shiftT = Math.max(0, this.shiftT - dt);
-    if (!this.reverse && this.shiftT === 0) {
-      const rUp = carRpmW * P.gears[this.gear - 1] * P.final;
-      if (rUp > 6000 && this.gear < 5) { this.gear++; this.shiftT = 0.22; }
-      else if (this.gear > 1 && carRpmW * P.gears[this.gear - 2] * P.final < 4300 && rUp < 2700) { this.gear--; this.shiftT = 0.18; }
+    if (!(acceleratorControl > 0) && !(brakeControl > 0) && this.reverse && forwardSpeed > 0.2) this.reverse = false;
+    this.throttle += clamp(requestedThrottle - this.throttle, -8 * deltaTimeSeconds, 6 * deltaTimeSeconds);
+    this.brake += clamp(requestedBrake - this.brake, -10 * deltaTimeSeconds, 7 * deltaTimeSeconds);
+    this.handbrake += clamp((controls.hand ? 1 : 0) - this.handbrake, -10 * deltaTimeSeconds, 12 * deltaTimeSeconds);
+  }
+
+  /** Automatic shifting and engine power, returning drive-axle torque in N·m. */
+  updatePowertrain(deltaTimeSeconds) {
+    const parameters = PHYS;
+    // Use driven-wheel RPM for engine speed, but car speed for gear changes (avoids wheel-lock downshifts).
+    const drivenWheelRpm = Math.abs((this.wheelAngularVelocities[0] + this.wheelAngularVelocities[1]) * 0.5) * 60 / TAU;
+    const vehicleWheelRpm = Math.abs(this.forwardVelocity) / parameters.R * 60 / TAU;
+    this.gearShiftCooldown = Math.max(0, this.gearShiftCooldown - deltaTimeSeconds);
+    if (!this.reverse && this.gearShiftCooldown === 0) {
+      const predictedEngineRpm = vehicleWheelRpm * parameters.gears[this.gear - 1] * parameters.final;
+      if (predictedEngineRpm > 6000 && this.gear < 5) { this.gear++;
+      this.gearShiftCooldown = 0.22; }
+      else if (this.gear > 1 && vehicleWheelRpm * parameters.gears[this.gear - 2] * parameters.final < 4300 && predictedEngineRpm < 2700) { this.gear--;
+      this.gearShiftCooldown = 0.18; }
     }
-    const ratio = this.reverse ? P.revGear : P.gears[this.gear - 1];
-    this.rpm = Math.max(P.idle, Math.max(wheelRpmF, carRpmW * 0.98) * ratio * P.final);
+    const transmissionRatio = this.reverse ? parameters.revGear : parameters.gears[this.gear - 1];
+    this.rpm = Math.max(parameters.idle, Math.max(drivenWheelRpm, vehicleWheelRpm * 0.98) * transmissionRatio * parameters.final);
     if (this.reverse) this.gear = 1;
-    const cutting = this.shiftT > 0.12;
-    let engT = engineTorque(Math.min(this.rpm, P.redline)) * this.thr * (cutting ? 0.1 : 1);
-    if (this.rpm >= P.redline) engT *= 0.2;
-    const driveT = engT * ratio * P.final * 0.9 * (this.reverse ? -1 : 1);
-    // ---- cargas (transferência com acelerações do passo anterior)
-    const L = P.cgA + P.cgB, m = P.mass, g = P.g;
-    const fzF = m * g * P.cgB / L - m * this.ax * P.cgH / L;
-    const fzR = m * g * P.cgA / L + m * this.ax * P.cgH / L;
-    const latF = m * this.ay * P.cgH / 1.34 * 0.6, latR = m * this.ay * P.cgH / 1.31 * 0.4;
-    this.load[0] = Math.max(50, fzF * 0.5 + latF); this.load[1] = Math.max(50, fzF * 0.5 - latF);
-    this.load[2] = Math.max(50, fzR * 0.5 + latR); this.load[3] = Math.max(50, fzR * 0.5 - latR);
-    // ---- forças dos pneus (subpassos para a rotação das rodas)
-    const subDt = dt / P.SUB;
-    let Fx = 0, Fy = 0, Mz = 0;
-    for (let k = 0; k < 4; k++) { this.fx[k] = 0; this.fy[k] = 0; }
-    for (let ss = 0; ss < P.SUB; ss++) {
-      for (let k = 0; k < 4; k++) {
-        const front = k < 2;
-        const a = front ? P.cgA : -P.cgB;
-        const b = (k & 1 ? 1 : -1) * (front ? 0.67 : 0.655);
-        const vxl = this.u - this.r * b, vyl = this.v + this.r * a;
-        const d = front ? this.steer * (1 + (k & 1 ? -1 : 1) * this.steer * 0.12) : 0;
-        const cd = Math.cos(d), sd = Math.sin(d);
-        const vl = vxl * cd + vyl * sd, vt = -vxl * sd + vyl * cd;
-        // atrito por superfície
-        const sf = this.surf[k];
-        let mu = sf === 0 ? 1.0 - this.wetW[k] * 0.22 : sf === 1 ? 0.9 : sf === 2 ? 0.6 : 0.52;
-        const Fz = this.load[k];
-        const wR = this.w[k] * P.R;
-        const den = Math.max(Math.abs(vl), 1.0);
-        const kappa = (wR - vl) / den;
-        const alpha = Math.atan2(vt, Math.max(Math.abs(vl), 0.8));
-        const sx = kappa / 0.11, sy = Math.tan(alpha) / 0.13;
-        const sMag = Math.hypot(sx, sy);
-        let F = 0;
-        if (sMag > 1e-6) {
-          // curva mágica normalizada (pico em s=1, cai para ~0.8 deslizando)
-          const B = 1.35, C = 1.65, E = 0.2;
-          const bs = B * sMag;
-          const peak = Math.sin(C * Math.atan(B - E * (B - Math.atan(B))));
-          F = mu * Fz * Math.sin(C * Math.atan(bs - E * (bs - Math.atan(bs)))) / peak;
+    const duringGearShift = this.gearShiftCooldown > 0.12;
+    let engineTorqueNm = engineTorque(Math.min(this.rpm, parameters.redline)) * this.throttle * (duringGearShift ? 0.1 : 1);
+    if (this.rpm >= parameters.redline) engineTorqueNm *= 0.2;
+    const driveTorqueNm = engineTorqueNm * transmissionRatio * parameters.final * 0.9 * (this.reverse ? -1 : 1);
+    return driveTorqueNm;
+  }
+
+  /** Normal force on each wheel after longitudinal and lateral load transfer. */
+  updateWheelLoads() {
+    const parameters = PHYS;
+    const wheelbase = parameters.cgA + parameters.cgB, massKg = parameters.mass, gravity = parameters.g;
+    const frontAxleLoad = massKg * gravity * parameters.cgB / wheelbase - massKg * this.forwardAcceleration * parameters.cgH / wheelbase;
+    const rearAxleLoad = massKg * gravity * parameters.cgA / wheelbase + massKg * this.forwardAcceleration * parameters.cgH / wheelbase;
+    const frontLoadTransfer = massKg * this.lateralAcceleration * parameters.cgH / 1.34 * 0.6, rearLoadTransfer = massKg * this.lateralAcceleration * parameters.cgH / 1.31 * 0.4;
+    this.wheelNormalLoads[0] = Math.max(50, frontAxleLoad * 0.5 + frontLoadTransfer);
+    this.wheelNormalLoads[1] = Math.max(50, frontAxleLoad * 0.5 - frontLoadTransfer);
+    this.wheelNormalLoads[2] = Math.max(50, rearAxleLoad * 0.5 + rearLoadTransfer);
+    this.wheelNormalLoads[3] = Math.max(50, rearAxleLoad * 0.5 - rearLoadTransfer);
+  }
+
+  /**
+   * Calculate combined-slip tire forces and integrate the body and wheel motion.
+   * Scratch typed arrays are reused to avoid allocations per frame.
+   */
+  integrateVehicleDynamics(deltaTimeSeconds, driveTorqueNm) {
+    const parameters = PHYS;
+    const massKg = parameters.mass;
+    const gravity = parameters.g;
+    const tireSubstepDuration = deltaTimeSeconds / parameters.SUB;
+    let netForwardForce = 0, netLateralForce = 0, netYawTorque = 0;
+    for (let wheelIndex = 0; wheelIndex < 4; wheelIndex++) { this.wheelForwardForces[wheelIndex] = 0;
+    this.wheelLateralForces[wheelIndex] = 0; }
+    for (let substepIndex = 0; substepIndex < parameters.SUB; substepIndex++) {
+      for (let wheelIndex = 0; wheelIndex < 4; wheelIndex++) {
+        const isFrontWheel = wheelIndex < 2;
+        const axleDistance = isFrontWheel ? parameters.cgA : -parameters.cgB;
+        const wheelSideOffset = (wheelIndex & 1 ? 1 : -1) * (isFrontWheel ? 0.67 : 0.655);
+        const wheelForwardSpeed = this.forwardVelocity - this.yawRate * wheelSideOffset, wheelSideSpeed = this.lateralVelocity + this.yawRate * axleDistance;
+        const wheelSteeringAngle = isFrontWheel ? this.steeringAngle * (1 + (wheelIndex & 1 ? -1 : 1) * this.steeringAngle * 0.12) : 0;
+        const steeringCosine = Math.cos(wheelSteeringAngle), steeringSine = Math.sin(wheelSteeringAngle);
+        const tireForwardSpeed = wheelForwardSpeed * steeringCosine + wheelSideSpeed * steeringSine, tireSideSpeed = -wheelForwardSpeed * steeringSine + wheelSideSpeed * steeringCosine;
+        // Grip depends on road surface and wetness.
+        const surfaceType = this.wheelSurfaceTypes[wheelIndex];
+        let surfaceGrip = surfaceType === 0 ? 1.0 - this.wheelWetness[wheelIndex] * 0.22 : surfaceType === 1 ? 0.9 : surfaceType === 2 ? 0.6 : 0.52;
+        const wheelLoad = this.wheelNormalLoads[wheelIndex];
+        const wheelContactSpeed = this.wheelAngularVelocities[wheelIndex] * parameters.R;
+        const slipDenominator = Math.max(Math.abs(tireForwardSpeed), 1.0);
+        const longitudinalSlip = (wheelContactSpeed - tireForwardSpeed) / slipDenominator;
+        const lateralSlipAngle = Math.atan2(tireSideSpeed, Math.max(Math.abs(tireForwardSpeed), 0.8));
+        const longitudinalSlipScaled = longitudinalSlip / 0.11, lateralSlipScaled = Math.tan(lateralSlipAngle) / 0.13;
+        const combinedSlip = Math.hypot(longitudinalSlipScaled, lateralSlipScaled);
+        let tireGripForce = 0;
+        if (combinedSlip > 1e-6) {
+          // Normalized Magic Formula-like grip curve: peak near slip=1, declining after sliding.
+          const magicB = 1.35, magicC = 1.65, magicE = 0.2;
+          const magicInput = magicB * combinedSlip;
+          const peakGrip = Math.sin(magicC * Math.atan(magicB - magicE * (magicB - Math.atan(magicB))));
+          tireGripForce = surfaceGrip * wheelLoad * Math.sin(magicC * Math.atan(magicInput - magicE * (magicInput - Math.atan(magicInput)))) / peakGrip;
         }
-        let fl = sMag > 1e-6 ? F * sx / sMag : 0;
-        let ft = sMag > 1e-6 ? -F * sy / sMag : 0;
-        // amortecimento em baixa velocidade (evita tremor parado)
-        const lowS = clamp(1 - Math.abs(vl) / 1.5, 0, 1);
-        ft = lerp(ft, -vt * Fz * 0.35, lowS * 0.7);
-        // resistência de rolagem + grama/brita
-        const rr = (sf >= 2 ? (sf === 3 ? 0.11 : 0.045) : P.roll) * Fz * Math.sign(vl) * Math.min(Math.abs(vl), 1);
-        // rotação da roda
-        let T = 0;
-        if (front) T += driveT * 0.5;
-        const bT = (front ? P.brakeF : P.brakeR) * this.brk + (front ? 0 : P.handbrake * this.hb);
-        const wNew = this.w[k] + (T - fl * P.R) / P.Iw * subDt;
-        // freio: torque oposto à rotação, sem inverter o sentido
-        const bw = bT / P.Iw * subDt;
-        if (Math.abs(wNew) <= bw) this.w[k] = 0; else this.w[k] = wNew - Math.sign(wNew) * bw;
-        // forças no carro (frame local)
-        const fxl = (fl - rr) * cd - ft * sd, fyl = (fl - rr) * sd + ft * cd;
-        this.fx[k] += fxl / P.SUB; this.fy[k] += fyl / P.SUB;
-        this.slip[k] = Math.hypot(wR - vl, vt);
-        this.sn[k] = sMag;
+        let tireForwardForce = combinedSlip > 1e-6 ? tireGripForce * longitudinalSlipScaled / combinedSlip : 0;
+        let tireSideForce = combinedSlip > 1e-6 ? -tireGripForce * lateralSlipScaled / combinedSlip : 0;
+        // Dampen low-speed lateral tire oscillation.
+        const nearStopBlend = clamp(1 - Math.abs(tireForwardSpeed) / 1.5, 0, 1);
+        tireSideForce = lerp(tireSideForce, -tireSideSpeed * wheelLoad * 0.35, nearStopBlend * 0.7);
+        // Rolling resistance increases on grass and gravel.
+        const rollingResistanceForce = (surfaceType >= 2 ? (surfaceType === 3 ? 0.11 : 0.045) : parameters.roll) * wheelLoad * Math.sign(tireForwardSpeed) * Math.min(Math.abs(tireForwardSpeed), 1);
+        // Integrate the wheel's angular speed.
+        let wheelDriveTorque = 0;
+        if (isFrontWheel) wheelDriveTorque += driveTorqueNm * 0.5;
+        const wheelBrakeTorque = (isFrontWheel ? parameters.brakeF : parameters.brakeR) * this.brake + (isFrontWheel ? 0 : parameters.handbrake * this.handbrake);
+        const unbrakedWheelSpeed = this.wheelAngularVelocities[wheelIndex] + (wheelDriveTorque - tireForwardForce * parameters.R) / parameters.Iw * tireSubstepDuration;
+        // Braking opposes rotation but never reverses the wheel in one substep.
+        const brakeAngularDelta = wheelBrakeTorque / parameters.Iw * tireSubstepDuration;
+        if (Math.abs(unbrakedWheelSpeed) <= brakeAngularDelta) this.wheelAngularVelocities[wheelIndex] = 0; else this.wheelAngularVelocities[wheelIndex] = unbrakedWheelSpeed - Math.sign(unbrakedWheelSpeed) * brakeAngularDelta;
+        // Rotate tire forces into the car's local forward/right coordinates.
+        const forwardTireForce = (tireForwardForce - rollingResistanceForce) * steeringCosine - tireSideForce * steeringSine, sideTireForce = (tireForwardForce - rollingResistanceForce) * steeringSine + tireSideForce * steeringCosine;
+        this.wheelForwardForces[wheelIndex] += forwardTireForce / parameters.SUB;
+        this.wheelLateralForces[wheelIndex] += sideTireForce / parameters.SUB;
+        this.slip[wheelIndex] = Math.hypot(wheelContactSpeed - tireForwardSpeed, tireSideSpeed);
+        this.normalizedTireSlip[wheelIndex] = combinedSlip;
       }
     }
-    for (let k = 0; k < 4; k++) {
-      const front = k < 2;
-      const a = front ? P.cgA : -P.cgB, b = (k & 1 ? 1 : -1) * (front ? 0.67 : 0.655);
-      Fx += this.fx[k]; Fy += this.fy[k];
-      Mz += a * this.fy[k] - b * this.fx[k];
+    for (let wheelIndex = 0; wheelIndex < 4; wheelIndex++) {
+      const isFrontWheel = wheelIndex < 2;
+      const axleDistance = isFrontWheel ? parameters.cgA : -parameters.cgB, wheelSideOffset = (wheelIndex & 1 ? 1 : -1) * (isFrontWheel ? 0.67 : 0.655);
+      netForwardForce += this.wheelForwardForces[wheelIndex]; netLateralForce += this.wheelLateralForces[wheelIndex];
+      netYawTorque += axleDistance * this.wheelLateralForces[wheelIndex] - wheelSideOffset * this.wheelForwardForces[wheelIndex];
     }
-    // arrasto + gravidade na rampa
-    const sp = Math.hypot(this.u, this.v);
-    Fx -= P.dragK * this.u * sp; Fy -= P.dragK * this.v * sp * 1.5;
-    Fx -= m * g * Math.sin(this.pitchG);
-    Fy += m * g * Math.sin(this.rollG) * 0.0;
-    // ---- integração (frame local girando)
-    const axl = Fx / m, ayl = Fy / m;
-    this.u += (axl + this.r * this.v) * dt;
-    this.v += (ayl - this.r * this.u) * dt;
-    this.r += Mz / P.Iz * dt;
-    this.ax = lerp(this.ax, axl, 0.25); this.ay = lerp(this.ay, ayl + this.r * this.u * 0, 0.25);
-    this.ay = lerp(this.ay, ayl, 0.0);
-    const c = Math.cos(this.psi), sn = Math.sin(this.psi);
-    this.x += (c * this.u - sn * this.v) * dt;
-    this.z += (sn * this.u + c * this.v) * dt;
-    this.psi += this.r * dt;
-    for (let k = 0; k < 4; k++) this.spin[k] = (this.spin[k] + this.w[k] * dt) % TAU;
+    // Aerodynamic drag and downhill/uphill gravity component.
+    const totalSpeed = Math.hypot(this.forwardVelocity, this.lateralVelocity);
+    netForwardForce -= parameters.dragK * this.forwardVelocity * totalSpeed; netLateralForce -= parameters.dragK * this.lateralVelocity * totalSpeed * 1.5;
+    netForwardForce -= massKg * gravity * Math.sin(this.roadPitch);
+    netLateralForce += massKg * gravity * Math.sin(this.roadRoll) * 0.0;
+    // Integrate in the rotating car-local coordinate frame.
+    const forwardAcceleration = netForwardForce / massKg, sideAcceleration = netLateralForce / massKg;
+    this.forwardVelocity += (forwardAcceleration + this.yawRate * this.lateralVelocity) * deltaTimeSeconds;
+    this.lateralVelocity += (sideAcceleration - this.yawRate * this.forwardVelocity) * deltaTimeSeconds;
+    this.yawRate += netYawTorque / parameters.Iz * deltaTimeSeconds;
+    this.forwardAcceleration = lerp(this.forwardAcceleration, forwardAcceleration, 0.25);
+    this.lateralAcceleration = lerp(this.lateralAcceleration, sideAcceleration + this.yawRate * this.forwardVelocity * 0, 0.25);
+    this.lateralAcceleration = lerp(this.lateralAcceleration, sideAcceleration, 0.0);
+    const headingCosine = Math.cos(this.headingRadians), headingSine = Math.sin(this.headingRadians);
+    this.x += (headingCosine * this.forwardVelocity - headingSine * this.lateralVelocity) * deltaTimeSeconds;
+    this.z += (headingSine * this.forwardVelocity + headingCosine * this.lateralVelocity) * deltaTimeSeconds;
+    this.headingRadians += this.yawRate * deltaTimeSeconds;
+    for (let wheelIndex = 0; wheelIndex < 4; wheelIndex++) this.wheelSpinAngles[wheelIndex] = (this.wheelSpinAngles[wheelIndex] + this.wheelAngularVelocities[wheelIndex] * deltaTimeSeconds) % TAU;
     this.updateGround();
     this.collide();
-    // ---- suspensão visual (rolagem/arfagem/vertical)
-    const ayT = ayl, axT = axl;
-    const rollT = -ayT * 0.0125, pitchT = axT * 0.0058;
-    this.rollV += ((rollT - this.roll) * 90 - this.rollV * 11) * dt; this.roll += this.rollV * dt;
-    this.pitchV += ((pitchT - this.pitch) * 110 - this.pitchV * 13) * dt; this.pitch += this.pitchV * dt;
-    this.heaveV += ((0 - this.heave) * 160 - this.heaveV * 16) * dt; this.heave += this.heaveV * dt;
-    this.time += dt;
+    // Spring-damper approximation for visual roll, pitch, and heave.
+    const sideAccelerationForBody = sideAcceleration, forwardAccelerationForBody = forwardAcceleration;
+    const targetBodyRoll = -sideAccelerationForBody * 0.0125, targetBodyPitch = forwardAccelerationForBody * 0.0058;
+    this.rollVelocity += ((targetBodyRoll - this.roll) * 90 - this.rollVelocity * 11) * deltaTimeSeconds;
+    this.roll += this.rollVelocity * deltaTimeSeconds;
+    this.pitchVelocity += ((targetBodyPitch - this.pitch) * 110 - this.pitchVelocity * 13) * deltaTimeSeconds;
+    this.pitch += this.pitchVelocity * deltaTimeSeconds;
+    this.heaveVelocity += ((0 - this.heave) * 160 - this.heaveVelocity * 16) * deltaTimeSeconds;
+    this.heave += this.heaveVelocity * deltaTimeSeconds;
+    this.elapsedSeconds += deltaTimeSeconds;
   }
-  // barreiras: cantos do carro contra a distância lateral da parede
+  // Collision: check each car corner against trackside barriers.
+  /** Resolve barrier penetration, bounce and frictional impact impulses. */
   collide() {
-    const T = TRACK, o = this._p;
-    const c = Math.cos(this.psi), sn = Math.sin(this.psi);
-    this.wallHit = 0;
+    const T = TRACK, o = this._trackProjection;
+    const c = Math.cos(this.headingRadians), sn = Math.sin(this.headingRadians);
+    this.wallImpactSpeed = 0;
     for (let k = 0; k < 4; k++) {
       const a = k < 2 ? 1.85 : -1.83, b = (k & 1 ? 1 : -1) * 0.78;
       const x = this.x + c * a - sn * b, z = this.z + sn * a + c * b;
-      T.project(x, z, this.hint, o);
+      T.project(x, z, this.trackSegmentHint, o);
       const s = o[0], u = o[1];
       const wall = (u > 0 ? T.lerpArr(T.wallR, s) : T.lerpArr(T.wallL, s)) - 0.35;
       const pen = Math.abs(u) - wall;
       if (pen > 0) {
-        // normal da parede (para dentro da pista)
+        // Inward-facing wall contact normal.
         const i = o[2] | 0;
         const rx = -T.tz[i], rz = T.tx[i];
         const nx = -Math.sign(u) * rx, nz = -Math.sign(u) * rz;
-        this.x += nx * pen; this.z += nz * pen;
-        // velocidade do ponto (mundo)
-        const vxw = c * this.u - sn * this.v, vzw = sn * this.u + c * this.v;
+        this.x += nx * pen;
+        this.z += nz * pen;
+        // Velocity of the contact point in world coordinates.
+        const vxw = c * this.forwardVelocity - sn * this.lateralVelocity, vzw = sn * this.forwardVelocity + c * this.lateralVelocity;
         const rxp = x - this.x, rzp = z - this.z;
-        // ω × r em 2D (ψ positivo gira frente -> direita; no plano x,z: ω·(-rz, rx))
-        const pvx = vxw - this.r * rzp, pvz = vzw + this.r * rxp;
+        // Add angular velocity cross contact-offset in the X/Z plane.
+        const pvx = vxw - this.yawRate * rzp, pvz = vzw + this.yawRate * rxp;
         const vn = pvx * nx + pvz * nz;
         if (vn < 0) {
           const rn = rxp * nz - rzp * nx;
           const j = -(1.25) * vn / (1 / PHYS.mass + rn * rn / PHYS.Iz);
           let ix = j * nx, iz = j * nz;
-          // atrito tangencial
+          // Tangential wall friction impulse.
           const tx = -nz, tz = nx, vt = pvx * tx + pvz * tz;
           const jt = clamp(-vt / (1 / PHYS.mass + 1 / PHYS.Iz), -0.4 * j, 0.4 * j);
           ix += jt * tx; iz += jt * tz;
           const dvx = ix / PHYS.mass, dvz = iz / PHYS.mass;
-          // volta para local
-          this.u += c * dvx + sn * dvz;
-          this.v += -sn * dvx + c * dvz;
-          this.r += (rxp * iz - rzp * ix) / PHYS.Iz;
-          this.wallHit = Math.max(this.wallHit, -vn);
+          // Convert collision impulse back to car-local velocity.
+          this.forwardVelocity += c * dvx + sn * dvz;
+          this.lateralVelocity += -sn * dvx + c * dvz;
+          this.yawRate += (rxp * iz - rzp * ix) / PHYS.Iz;
+          this.wallImpactSpeed = Math.max(this.wallImpactSpeed, -vn);
         }
       }
     }

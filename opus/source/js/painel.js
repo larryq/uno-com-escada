@@ -91,7 +91,7 @@ const HUD = (() => {
   }
   // LT: [volta em curso (s), última (s), melhor (s)] (−1 = sem tempo); lê o carro e o giro do som direto dos arrays
   H.draw = (car, LT) => {
-    const kmh = Math.abs(car.u) * 3.6, rpm = SND.M[0], gear = car.reverse ? 13 : car.gear;
+    const kmh = Math.abs(car.forwardVelocity) * 3.6, rpm = SND.M[0], gear = car.reverse ? 13 : car.gear;
     const k10 = (kmh * 4) | 0, r10 = (rpm / 12) | 0;
     if (k10 !== L[0] || r10 !== L[1] || gear !== L[2]) {
       L[0] = k10; L[1] = r10; L[2] = gear;
